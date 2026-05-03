@@ -13455,6 +13455,16 @@ class LazyTorchTensor(gguf.LazyBase):
     @classmethod
     def from_local_tensor(cls, t: gguf.utility.LocalTensor) -> Tensor:
         def load_tensor(tensor: gguf.utility.LocalTensor) -> Tensor:
+            if tensor.dtype == "F8_E8M0" and getattr(torch, "float8_e8m0fnu", None) is None:
+                # Fallback decode for environments where PyTorch lacks float8_e8m0fnu.
+                x = tensor.mmap_bytes().view(np.uint8)
+                bits = np.where(
+                    x < 2,
+                    np.uint32(0x00200000) << x.astype(np.uint32),
+                    (x.astype(np.uint32) - np.uint32(1)) << np.uint32(23),
+                )
+                return torch.from_numpy(bits.view(np.float32)).reshape(tensor.shape)
+
             def byteswap_tensor(tensor: np.ndarray, dtype: type) -> np.ndarray:
                 if sys.byteorder == 'big':
                     # switch data back to big endian
@@ -13499,6 +13509,9 @@ class LazyTorchTensor(gguf.LazyBase):
 if (torch_float8_e8m0fnu := getattr(torch, "float8_e8m0fnu", None)) is not None:
     LazyTorchTensor._dtype_byteswap_map[torch_float8_e8m0fnu] = np.uint8
     LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch_float8_e8m0fnu
+else:
+    # Keep conversion functional on PyTorch builds without float8_e8m0fnu.
+    LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch.float32
 
 
 def parse_args() -> argparse.Namespace:
