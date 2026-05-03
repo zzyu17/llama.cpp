@@ -109,6 +109,7 @@ class ModelBase:
     is_mistral_format: bool = False
     disable_mistral_community_chat_template: bool = False
     sentence_transformers_dense_modules: bool = False
+    supports_moe_f8_e4m3_mxfp4: bool = False
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -271,22 +272,6 @@ class ModelBase:
                                      f"Extra tensors: {extra}")
 
         return tensors
-
-    @staticmethod
-    def _scale_is_trivial(scale: Tensor) -> bool:
-        return scale.numel() <= 1 and abs(float(scale.float().sum()) - 1.0) < 1e-6
-
-    def _write_scale_tensor(self, scale_name: str, scale: Tensor):
-        if not self._scale_is_trivial(scale):
-            scale_f32 = scale.float().numpy().flatten()
-            logger.info(f"  + {scale_name} (per-tensor scale, shape [{scale_f32.size}])")
-            self.gguf_writer.add_tensor(scale_name, scale_f32)
-
-    def _write_scales_tensor(self, scale_name: str, scales: list[float]):
-        if not np.allclose(scales, 1.0, atol=1e-6):
-            scale_vals = np.array(scales, dtype=np.float32)
-            logger.info(f"  + {scale_name} (per-expert scale, shape [{len(scales)}])")
-            self.gguf_writer.add_tensor(scale_name, scale_vals)
 
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
@@ -510,7 +495,7 @@ class ModelBase:
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
                         tensors_to_remove.append(name)
-                    if name.endswith((".input_scale", ".k_scale", ".v_scale")):
+                    if name.endswith((".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
@@ -618,6 +603,10 @@ class ModelBase:
         raw = np.concatenate([d_grouped, qs_grouped], axis=-1).reshape(out_features, n_super * 36)
         return raw, [out_features, n_super * 64]
 
+    @staticmethod
+    def _nvfp4_scale2_is_trivial(scale2: Tensor) -> bool:
+        return scale2.numel() <= 1 and abs(float(scale2.float().sum()) - 1.0) < 1e-6
+
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         if "language_model." in name:
             name = name.replace("language_model.", "")
@@ -628,8 +617,19 @@ class ModelBase:
         logger.info(f"Repacked {new_name} with shape {shape} and quantization NVFP4")
         self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
 
-        self._write_scale_tensor(new_name.replace(".weight", ".scale"), scale2)
-        self._write_scale_tensor(new_name.replace(".weight", ".input_scale"), input_scale)
+        # Emit per-tensor scale2 as a separate F32 tensor when non-trivial
+        if not self._nvfp4_scale2_is_trivial(scale2):
+            scale2_f32 = scale2.float().numpy().flatten()
+            scale_name = new_name.replace(".weight", ".scale")
+            logger.info(f"  + {scale_name} (per-tensor NVFP4 scale2, shape [{scale2_f32.size}])")
+            self.gguf_writer.add_tensor(scale_name, scale2_f32)
+
+        # Emit per-tensor input_scale as a separate F32 tensor when non-trivial
+        if not self._nvfp4_scale2_is_trivial(input_scale):
+            input_scale_f32 = input_scale.float().numpy().flatten()
+            input_scale_name = new_name.replace(".weight", ".input_scale")
+            logger.info(f"  + {input_scale_name} (per-tensor NVFP4 input_scale, shape [{input_scale_f32.size}])")
+            self.gguf_writer.add_tensor(input_scale_name, input_scale_f32)
 
     def _generate_nvfp4_tensors(self):
         # Per-layer expert merging to avoid holding all experts in memory
@@ -720,16 +720,23 @@ class ModelBase:
         logger.info(f"Repacked {new_name} with shape [{len(experts)}, {shape[0]}, {shape[1]}] and quantization NVFP4")
         self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
 
+        # Emit per-expert scale2 tensor if any expert has non-trivial scale2
         scales.sort(key=lambda x: x[0])
-        self._write_scales_tensor(new_name.replace(".weight", ".scale"), [s[1] for s in scales])
+        scale_vals = np.array([s[1] for s in scales], dtype=np.float32)
+        if not np.allclose(scale_vals, 1.0, atol=1e-6):
+            scale_name = new_name.replace(".weight", ".scale")
+            logger.info(f"  + {scale_name} (per-expert NVFP4 scale2, shape [{len(scales)}])")
+            self.gguf_writer.add_tensor(scale_name, scale_vals)
 
+        # Emit per-expert input_scale tensor if any expert has non-trivial input_scale
         input_scales.sort(key=lambda x: x[0])
-        self._write_scales_tensor(new_name.replace(".weight", ".input_scale"), [s[1] for s in input_scales])
+        input_scale_vals = np.array([s[1] for s in input_scales], dtype=np.float32)
+        if not np.allclose(input_scale_vals, 1.0, atol=1e-6):
+            input_scale_name = new_name.replace(".weight", ".input_scale")
+            logger.info(f"  + {input_scale_name} (per-expert NVFP4 input_scale, shape [{len(input_scales)}])")
+            self.gguf_writer.add_tensor(input_scale_name, input_scale_vals)
 
         del experts, merged
-
-    def _needs_nvfp4_processing(self) -> bool:
-        return True
 
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt format)
@@ -761,7 +768,7 @@ class ModelBase:
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
-        if self._is_nvfp4 and self._needs_nvfp4_processing():
+        if self._is_nvfp4:
             self._generate_nvfp4_tensors()
 
         self.dequant_model()
@@ -780,7 +787,9 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            preserve_moe_mixed_quant_tensor = name in getattr(self, "_preserve_moe_mixed_quant_tensors", set())
+            preserve_integer_tensor = name.endswith(".ffn.gate.tid2eid") or preserve_moe_mixed_quant_tensor
+            if data_torch.dtype not in (torch.float16, torch.float32) and not preserve_integer_tensor:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -791,6 +800,13 @@ class ModelBase:
                     break
 
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
+                if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.FFN_GATE_TID2EID, bid, suffix=""):
+                    data = LazyTorchTensor.to_eager(data_torch).to(torch.int32).numpy()
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> I32, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data)
+                    continue
+
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
@@ -868,6 +884,8 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4_MOE:
+                        data_qtype = gguf.GGMLQuantizationType.BF16
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
@@ -2192,10 +2210,6 @@ class MmprojModel(ModelBase):
                     }
                 # merge configs
                 self.preprocessor_config = {**self.preprocessor_config, **cfg}
-
-    def _needs_nvfp4_processing(self) -> bool:
-        # nvfp4 quantization applies to the text model only.
-        return False
 
     def get_vision_config(self) -> dict[str, Any] | None:
         config_name = "vision_config" if not self.is_mistral_format else "vision_encoder"
@@ -4457,12 +4471,6 @@ class NemotronNanoV2VLModel(MmprojModel):
         }
         return vision_config
 
-    def dequant_model(self):
-        if self._is_nvfp4:
-            # Skip nvfp4 quantization for vision/audio model.
-            return
-        super().dequant_model()
-
     def set_gguf_parameters(self):
         if "image_mean" not in self.preprocessor_config:
             self.preprocessor_config["image_mean"] = [0.485, 0.456, 0.406]
@@ -4484,10 +4492,6 @@ class NemotronNanoV2VLModel(MmprojModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if "input_conditioner" in name:
-            return
-
-        # mtmd does not support video yet so skip tensors related to video.
-        if "radio_model.model.patch_generator.video_embedder" in name:
             return
 
         # RADIO's pos_embed doesn't have .weight suffix, but clip.cpp expects it
@@ -6658,7 +6662,7 @@ class BertModel(TextModel):
 
         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
         scores: list[float] = [-10000.0] * vocab_size
-        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size  # ty: ignore[invalid-assignment]
 
         if isinstance(tokenizer, SentencePieceProcessor):
             for token_id in range(tokenizer.vocab_size()):
@@ -9199,6 +9203,298 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+    skip_mtp = True
+    merge_expert = True
+    supports_moe_f8_e4m3_mxfp4 = True
+    chat_template = (
+        "{{ '<｜begin▁of▁sentence｜>' }}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ message['content'] }}"
+        "{% elif message['role'] == 'user' %}"
+        "{{ '<｜User｜>' + message['content'] }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ message['content'] + '<｜end▁of▁sentence｜>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<｜Assistant｜></think>' }}"
+        "{% endif %}"
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._preserve_moe_mixed_quant_tensors: set[str] = set()
+        self._moe_mixed_quant_weight_types: dict[str, gguf.GGMLQuantizationType] = {}
+        self._moe_mixed_quant_output_types: dict[str, gguf.GGMLQuantizationType] = {}
+        self._moe_mixed_quant_scales: dict[str, Callable[[], Tensor]] = {}
+
+    def dequant_model(self):
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if quant_method == "fp8":
+            if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4_MOE:
+                for name, gen in list(self.model_tensors.items()):
+                    if not name.endswith(".scale"):
+                        continue
+                    weight_name = name.removesuffix(".scale") + ".weight"
+                    if weight_name not in self.model_tensors:
+                        continue
+
+                    qtype = gguf.GGMLQuantizationType.MXFP4 if ".ffn.experts." in weight_name else gguf.GGMLQuantizationType.F8_E4M3_B128
+                    self._preserve_moe_mixed_quant_tensors.add(weight_name)
+                    self._moe_mixed_quant_weight_types[weight_name] = qtype
+                    self._moe_mixed_quant_scales[weight_name] = gen
+                    del self.model_tensors[name]
+
+                return super().dequant_model()
+
+            dequant_dtype = torch.float16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else None
+            fp4_table = torch.tensor([
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ], dtype=torch.float32)
+
+            def dequant_with_scale(weight: Tensor, scale: Tensor) -> Tensor:
+                scale = scale.float()
+
+                while scale.ndim < weight.ndim:
+                    scale = scale.unsqueeze(-1)
+
+                if scale.ndim != weight.ndim:
+                    raise ValueError(
+                        f"Unexpected DeepSeek V4 scale rank for weight {tuple(weight.shape)} and scale {tuple(scale.shape)}"
+                    )
+
+                for dim, (weight_dim, scale_dim) in enumerate(zip(weight.shape, scale.shape)):
+                    if scale_dim == weight_dim:
+                        continue
+                    if scale_dim <= 0 or scale_dim > weight_dim:
+                        raise ValueError(
+                            f"Unexpected DeepSeek V4 scale shape {tuple(scale.shape)} for weight {tuple(weight.shape)}"
+                        )
+                    repeat = (weight_dim + scale_dim - 1) // scale_dim
+                    if repeat > 1:
+                        scale = scale.repeat_interleave(repeat, dim)
+
+                scale = scale[tuple(slice(0, size) for size in weight.shape)]
+                return weight.float() * scale
+
+            def dequant_packed_expert(weight: Tensor, scale: Tensor) -> Tensor:
+                weight = LazyTorchTensor.to_eager(weight)
+                scale = LazyTorchTensor.to_eager(scale).float()
+
+                if weight.dtype != torch.int8 or weight.ndim != 2:
+                    raise ValueError(f"Unexpected DeepSeek V4 expert weight {tuple(weight.shape)} {weight.dtype}")
+
+                packed = weight.view(torch.uint8)
+                low = fp4_table[(packed & 0x0F).long()]
+                high = fp4_table[((packed >> 4) & 0x0F).long()]
+                unpacked = torch.stack([low, high], dim=-1).flatten(1, 2)
+
+                scale = scale.repeat_interleave(32, dim=1)
+                scale = scale[:, :unpacked.shape[1]]
+
+                return unpacked * scale
+
+            for name, gen in list(self.model_tensors.items()):
+                if not name.endswith(".scale"):
+                    continue
+                weight_name = name.removesuffix(".scale") + ".weight"
+                if weight_name not in self.model_tensors:
+                    continue
+
+                weight_gen = self.model_tensors[weight_name]
+                if ".ffn.experts." in weight_name:
+                    self.model_tensors[weight_name] = (
+                        lambda weight_gen=weight_gen, scale_gen=gen: dequant_packed_expert(weight_gen(), scale_gen())
+                    )
+                    del self.model_tensors[name]
+                    continue
+
+                self.model_tensors[weight_name] = (
+                    lambda weight_gen=weight_gen, scale_gen=gen: dequant_with_scale(weight_gen(), scale_gen())
+                )
+                del self.model_tensors[name]
+
+        return super().dequant_model()
+
+    @staticmethod
+    def _pack_f8_e4m3_b128(weight: Tensor, scale: Tensor, name: str) -> Tensor:
+        weight = LazyTorchTensor.to_eager(weight)
+        scale = LazyTorchTensor.to_eager(scale)
+
+        if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+            raise ValueError(f"Unexpected FP8 E4M3 tensor {name}: {tuple(weight.shape)} {weight.dtype}")
+
+        rows, cols = weight.shape
+        if rows % 128 != 0 or cols % 128 != 0:
+            raise ValueError(f"FP8 E4M3 tensor {name} shape {tuple(weight.shape)} is not divisible by 128x128")
+
+        row_blocks = rows // 128
+        col_blocks = cols // 128
+        if scale.ndim != 2 or scale.shape != (row_blocks, col_blocks):
+            raise ValueError(
+                f"Unexpected FP8 E4M3 scale {tuple(scale.shape)} for tensor {name} with shape {tuple(weight.shape)}"
+            )
+
+        weight_u8 = weight.view(torch.uint8)
+        scale_u8 = scale.view(torch.uint8)
+        out = torch.empty((rows, col_blocks, 129), dtype=torch.uint8)
+        out[:, :, 0].copy_(scale_u8.repeat_interleave(128, dim=0))
+        out[:, :, 1:].copy_(weight_u8.reshape(rows, col_blocks, 128))
+        return out.reshape(rows, col_blocks * 129)
+
+    @staticmethod
+    def _pack_mxfp4_moe(weight: Tensor, scale: Tensor, name: str) -> Tensor:
+        weight = LazyTorchTensor.to_eager(weight)
+        scale = LazyTorchTensor.to_eager(scale)
+
+        if weight.dtype != torch.int8 or weight.ndim != 2:
+            raise ValueError(f"Unexpected MXFP4 expert tensor {name}: {tuple(weight.shape)} {weight.dtype}")
+
+        rows, packed_cols = weight.shape
+        if packed_cols % 16 != 0:
+            raise ValueError(f"MXFP4 expert tensor {name} has {packed_cols} bytes per row, not a multiple of 16")
+
+        groups = packed_cols // 16
+        if scale.ndim != 2 or scale.shape[0] != rows or scale.shape[1] < groups:
+            raise ValueError(
+                f"Unexpected MXFP4 expert scale {tuple(scale.shape)} for tensor {name} with shape {tuple(weight.shape)}"
+            )
+
+        hf = weight.view(torch.uint8).reshape(rows, groups, 16)
+        vals = torch.empty((rows, groups, 32), dtype=torch.uint8)
+        vals[:, :, 0::2].copy_(hf & 0x0F)
+        vals[:, :, 1::2].copy_(hf >> 4)
+
+        out = torch.empty((rows, groups, 17), dtype=torch.uint8)
+        out[:, :, 0].copy_(scale.view(torch.uint8)[:, :groups])
+        out[:, :, 1:].copy_(vals[:, :, :16] | (vals[:, :, 16:] << 4))
+        return out.reshape(rows, groups * 17)
+
+    def set_gguf_parameters(self):
+        self.hparams["num_key_value_heads"] = self.hparams.get("num_key_value_heads", 1)
+        self.hparams["rms_norm_eps"] = self.hparams.get("rms_norm_eps", self.hparams.get("norm_eps", 1e-6))
+
+        score_func_keys = {}
+        for key in ("scoring_func", "score_func"):
+            if key in self.hparams:
+                score_func_keys[key] = self.hparams.pop(key)
+
+        try:
+            TextModel.set_gguf_parameters(self)
+        finally:
+            self.hparams.update(score_func_keys)
+
+        self.gguf_writer.add_chat_template(self.chat_template)
+
+        hparams = self.hparams
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        if (q_lora_rank := hparams.get("q_lora_rank")) is not None:
+            self.gguf_writer.add_q_lora_rank(q_lora_rank)
+
+        if (rope_dim := hparams.get("qk_rope_head_dim")) is not None:
+            self.gguf_writer.add_rope_dimension_count(rope_dim)
+
+        if (sliding_window := hparams.get("sliding_window")) is not None:
+            self.gguf_writer.add_sliding_window(sliding_window)
+
+        if (compress_rope_theta := hparams.get("compress_rope_theta")) is not None:
+            self.gguf_writer.add_rope_freq_base_swa(compress_rope_theta)
+
+        self.gguf_writer.add_leading_dense_block_count(0)
+
+        moe_intermediate_size = self.find_hparam(["moe_intermediate_size"], optional=False)
+        self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+
+        if (n_routed_experts := hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(n_routed_experts)
+
+        if (n_shared_experts := hparams.get("n_shared_experts")) is not None:
+            self.gguf_writer.add_expert_shared_count(n_shared_experts)
+
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+
+        if hparams.get("scoring_func") != "softmax":
+            self.gguf_writer.add_expert_weights_norm(True)
+
+        if (swiglu_limit := hparams.get("swiglu_limit")) is not None:
+            self.gguf_writer.add_swiglu_clamp_exp([float(swiglu_limit)] * self.block_count)
+
+        if (index_n_heads := hparams.get("index_n_heads")) is not None:
+            self.gguf_writer.add_indexer_head_count(index_n_heads)
+
+        if (index_head_dim := hparams.get("index_head_dim")) is not None:
+            self.gguf_writer.add_indexer_key_length(index_head_dim)
+
+        if (index_topk := hparams.get("index_topk")) is not None:
+            self.gguf_writer.add_indexer_top_k(index_topk)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("mtp."):
+            return
+
+        if self.hparams.get("tie_word_embeddings", False) and name == "head.weight":
+            logger.info("Skipping tied output layer 'head.weight' (will use token_embd.weight)")
+            return
+
+        moe_mixed_qtype = self._moe_mixed_quant_weight_types.get(name)
+        if moe_mixed_qtype is not None:
+            scale_gen = self._moe_mixed_quant_scales[name]
+            if moe_mixed_qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
+                data_torch = self._pack_f8_e4m3_b128(data_torch, scale_gen(), name)
+                for new_name, data_torch in TextModel.modify_tensors(self, data_torch, name, bid):
+                    self._moe_mixed_quant_output_types[new_name] = moe_mixed_qtype
+                    yield new_name, data_torch
+                return
+
+            if moe_mixed_qtype == gguf.GGMLQuantizationType.MXFP4:
+                data_torch = self._pack_mxfp4_moe(data_torch, scale_gen(), name)
+            else:
+                raise ValueError(f"Unsupported MoE mixed quantization type for {name}: {moe_mixed_qtype}")
+
+        if self.merge_expert and ".ffn.experts." in name:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                for w_name in ["w2", "w1", "w3"]:
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = f"layers.{bid}.ffn.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+
+                    merged = torch.stack(datas, dim=0)
+                    merged_name = f"layers.{bid}.ffn.experts.{w_name}.weight"
+                    for new_name, data_torch in TextModel.modify_tensors(self, merged, merged_name, bid):
+                        if moe_mixed_qtype == gguf.GGMLQuantizationType.MXFP4:
+                            self._moe_mixed_quant_output_types[new_name] = moe_mixed_qtype
+                        yield new_name, data_torch
+                return
+            else:
+                return
+
+        yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        qtype = self._moe_mixed_quant_output_types.get(new_name)
+        if qtype is not None:
+            return qtype
+
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+
 @ModelBase.register(
     "Mistral3ForConditionalGeneration",
     "Ministral3ForCausalLM",
@@ -10837,11 +11133,7 @@ class NemotronHModel(GraniteHybridModel):
         # uses self.model_arch to build the tensor name map, and all MoE-specific
         # mappings would be missed if it were called with the default non-MoE arch.
         hparams = ModelBase.load_hparams(args[0], self.is_mistral_format)
-        has_moe_params = (
-            "num_experts_per_tok" in hparams
-            or (isinstance(hparams.get("llm_config"), dict) and "num_experts_per_tok" in hparams["llm_config"])
-        )
-        if has_moe_params:
+        if "num_experts_per_tok" in hparams:
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
 
@@ -10986,11 +11278,6 @@ class NemotronHModel(GraniteHybridModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Skip vision model and projector tensors for VLM models (handled by mmproj) (e.g., Nemotron Nano 12B v2 VL)
         if name.startswith(("vision_model.", "mlp1.")):
-            return
-
-        if name.startswith(("sound_encoder.")):
-            return
-        if name.startswith(("sound_projection.")):
             return
 
         # Strip language_model. prefix for VLM models (e.g., Nemotron Nano 12B v2 VL)
@@ -13232,18 +13519,17 @@ class LazyTorchTensor(gguf.LazyBase):
     }
 
     # only used when byteswapping data. Only correct size is needed
-    # TODO: uncomment uint64, uint32, and uint16, ref: https://github.com/pytorch/pytorch/issues/58734
     _dtype_byteswap_map: dict[torch.dtype, type] = {
         torch.float64: np.float64,
         torch.float32: np.float32,
         torch.bfloat16: np.float16,
         torch.float16: np.float16,
         torch.int64: np.int64,
-        # torch.uint64: np.uint64,
+        torch.uint64: np.uint64,
         torch.int32: np.int32,
-        # torch.uint32: np.uint32,
+        torch.uint32: np.uint32,
         torch.int16: np.int16,
-        # torch.uint16: np.uint16,
+        torch.uint16: np.uint16,
         torch.int8: np.int8,
         torch.uint8: np.uint8,
         torch.bool: np.uint8,
@@ -13347,8 +13633,8 @@ def parse_args() -> argparse.Namespace:
         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
     )
     parser.add_argument(
-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"], default="auto",
-        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
+        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "moe-f8-e4m3-mxfp4", "auto"], default="auto",
+        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, moe-f8-e4m3-mxfp4 to preserve MoE FP8 E4M3 non-expert and MXFP4 expert source quantization formats, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -13523,6 +13809,7 @@ def main() -> None:
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
+        "moe-f8-e4m3-mxfp4": gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4_MOE,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
@@ -13565,6 +13852,15 @@ def main() -> None:
             model_class = MistralMoeModel
         else:
             model_class = MistralModel
+
+        if output_type == gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4_MOE and not model_class.supports_moe_f8_e4m3_mxfp4:
+            model_arch_name = model_architecture if not is_mistral_format else model_class.__name__
+            logger.error(
+                f"Model {model_arch_name} does not support --outtype moe-f8-e4m3-mxfp4; "
+                "this output type requires a converter that preserves MoE FP8 E4M3 non-expert tensors "
+                "and MXFP4 expert tensors."
+            )
+            sys.exit(1)
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
