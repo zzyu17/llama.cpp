@@ -469,6 +469,11 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+        }
+
         if (cparams.fused_gdn_ar) {
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
             if (!gf) {
@@ -2073,6 +2078,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        return std::max<uint32_t>(n_tokens * 256, 128u * model.n_tensors());
+    }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
@@ -2253,28 +2261,6 @@ public:
     llama_io_write_buffer(
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_write_buffer() {
-#if 1
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & info : winfos) {
-            ggml_backend_tensor_get(info.tensor, info.ptr, info.offset, info.size);
-        }
-#else
-        // flush the writes asynchronously
-        // this helps on Macs, but on other devices - it does not. just an example
-        std::vector<std::future<void>> futures;
-        futures.reserve(winfos.size());
-        for (const auto & info : winfos) {
-            futures.push_back(std::async(std::launch::async, [info]() {
-                ggml_backend_tensor_get(info.tensor, info.ptr, info.offset, info.size);
-            }));
-        }
-        for (auto & f : futures) {
-            f.wait();
-        }
-#endif
-    }
-
     void write(const void * src, size_t size) override {
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
@@ -2289,10 +2275,7 @@ public:
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
-
-        // save the write for later during destruction
-        winfos.push_back({tensor, ptr, size, offset});
-
+        ggml_backend_tensor_get(tensor, ptr, offset, size);
         ptr += size;
         size_written += size;
         buf_size -= size;
@@ -2306,48 +2289,25 @@ private:
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
-
-    struct write_info {
-        const ggml_tensor * tensor;
-        uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<write_info> winfos;
 };
 
 class llama_io_read_buffer : public llama_io_read_i {
 public:
     llama_io_read_buffer(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_read_buffer() {
-        // flush the reads
-        for (const auto & info : rinfos) {
-            ggml_backend_tensor_set(info.tensor, info.ptr, info.offset, info.size);
-        }
-    }
-
-    void read(void * dst, size_t size) override {
+    const uint8_t * read(size_t size) override {
+        const uint8_t * base_ptr = ptr;
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
-        memcpy(dst, ptr, size);
         ptr += size;
         size_read += size;
         buf_size -= size;
+        return base_ptr;
     }
 
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > buf_size) {
-            throw std::runtime_error("unexpectedly reached end of buffer");
-        }
-
-        // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset});
-
-        ptr += size;
-        size_read += size;
-        buf_size -= size;
+    void read_to(void * dst, size_t size) override {
+        memcpy(dst, read(size), size);
     }
 
     size_t n_bytes() override {
@@ -2358,14 +2318,6 @@ private:
     const uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_read = 0;
-
-    struct read_info {
-        ggml_tensor * tensor;
-        const uint8_t * ptr;
-        size_t size;
-        size_t offset;
-    };
-    std::vector<read_info> rinfos;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -2397,15 +2349,15 @@ class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
-    void read(void * dst, size_t size) override {
+    void read_to(void * dst, size_t size) override {
         file->read_raw(dst, size);
         size_read += size;
     }
 
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+    const uint8_t * read(size_t size) override {
         temp_buffer.resize(size);
-        read(temp_buffer.data(), size);
-        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        read_to(temp_buffer.data(), size);
+        return temp_buffer.data();
     }
 
     size_t n_bytes() override {
