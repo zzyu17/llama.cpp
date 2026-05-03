@@ -421,6 +421,19 @@ class ModelBase:
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
                         tensors_to_remove.append(name)
+                    if name.endswith(".scale"):
+                        base_name = name.removesuffix(".scale")
+                        if base_name + ".weight" in self.model_tensors:
+                            weight_name = base_name + ".weight"
+                        elif base_name in self.model_tensors:
+                            weight_name = base_name
+                        else:
+                            raise KeyError(f"Missing weight tensor for fp8 scale tensor {name}")
+
+                        w = self.model_tensors[weight_name]
+                        s = self.model_tensors[name]
+                        self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
+                        tensors_to_remove.append(name)
                     if name.endswith(".activation_scale"):  # unused
                         tensors_to_remove.append(name)
                     if name.endswith("_activation_scale"):  # Mistral-Small-4-119B-2602, unused
