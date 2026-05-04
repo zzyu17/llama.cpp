@@ -1244,14 +1244,27 @@ class TextModel(ModelBase):
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
-        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        except Exception as e:
+            tokenizer_file = self.dir_model / "tokenizer.json"
+            if not tokenizer_file.is_file():
+                raise
+            logger.warning(
+                "AutoTokenizer load failed (%s); falling back to tokenizer.json via PreTrainedTokenizerFast",
+                e,
+            )
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_file))
+
+        vocab = tokenizer.get_vocab()  # ty: ignore[unresolved-attribute]
+        vocab_size = self.hparams.get("vocab_size", len(vocab))
+        assert max(vocab.values()) < vocab_size
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
-        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
+        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in vocab.items()}
         added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
 
         added_tokens_decoder = tokenizer.added_tokens_decoder  # ty: ignore[unresolved-attribute]
