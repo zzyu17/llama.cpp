@@ -2295,19 +2295,21 @@ class llama_io_read_buffer : public llama_io_read_i {
 public:
     llama_io_read_buffer(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    const uint8_t * read(size_t size) override {
-        const uint8_t * base_ptr = ptr;
+    void read(void * dst, size_t size) override {
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
+        memcpy(dst, ptr, size);
         ptr += size;
         size_read += size;
         buf_size -= size;
-        return base_ptr;
     }
 
-    void read_to(void * dst, size_t size) override {
-        memcpy(dst, read(size), size);
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_tensor_set(tensor, ptr, offset, size);
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
     }
 
     size_t n_bytes() override {
@@ -2349,15 +2351,16 @@ class llama_io_read_file : public llama_io_read_i {
 public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
-    void read_to(void * dst, size_t size) override {
+    void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
         size_read += size;
     }
 
-    const uint8_t * read(size_t size) override {
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         temp_buffer.resize(size);
-        read_to(temp_buffer.data(), size);
-        return temp_buffer.data();
+        file->read_raw(temp_buffer.data(), size);
+        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        size_read += size;
     }
 
     size_t n_bytes() override {
