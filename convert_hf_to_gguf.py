@@ -9383,9 +9383,33 @@ class DeepseekV4Model(DeepseekV2Model):
             seen.add(xid)
 
             if all(len(layer_seen.get(done_w_name, set())) >= n_experts for done_w_name in ("w2", "w1", "w3")):
+                n_embd_full = self.hparams["hidden_size"]
+                n_ff_full = self.hparams["moe_intermediate_size"]
                 for done_w_name in ["w2", "w1", "w3"]:
                     merged = layer_buffers.pop(done_w_name)
                     del layer_seen[done_w_name]
+                    # Pad halved expert dimensions to match runtime expectations.
+                    # Per-expert source shapes (safetensors):
+                    #   w1/w3: [n_embd/2, n_ff_full]   -> stack [n_experts, n_embd/2, n_ff_full]
+                    #   w2:    [n_embd,    n_ff_full/2] -> stack [n_experts, n_embd,    n_ff_full/2]
+                    # Runtime expects GGUF dims:
+                    #   gate/up: ne = [n_embd, n_ff_exp, n_experts]
+                    #   down:    ne = [n_ff_exp, n_embd, n_experts]
+                    # => torch [n_experts, n_ff_exp, n_embd] for gate/up
+                    # => torch [n_experts, n_embd, n_ff_exp] for down
+                    if done_w_name in ("w1", "w3"):
+                        if merged.shape[1] < n_embd_full:
+                            padded = torch.zeros((merged.shape[0], n_embd_full, merged.shape[2]), dtype=merged.dtype)
+                            padded[:, :merged.shape[1], :] = merged
+                            merged = padded
+                        # permute to [n_experts, n_ff_exp, n_embd] -> GGUF ne=[n_embd, n_ff_exp, n_experts]
+                        merged = merged.permute(0, 2, 1)
+                    elif done_w_name == "w2":
+                        if merged.shape[2] < n_ff_full:
+                            padded = torch.zeros((merged.shape[0], merged.shape[1], n_ff_full), dtype=merged.dtype)
+                            padded[:, :, :merged.shape[2]] = merged
+                            merged = padded
+                        # stays [n_experts, n_embd, n_ff_exp] -> GGUF ne=[n_ff_exp, n_embd, n_experts]
                     merged_name = f"layers.{bid}.ffn.experts.{done_w_name}.weight"
                     for new_name, data_torch in TextModel.modify_tensors(self, merged, merged_name, bid):
                         yield new_name, data_torch
