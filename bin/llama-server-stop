@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PORT="${LLAMA_SERVER_PORT:-53084}"
+LOG_DIR="${LLAMA_SERVER_LOG_DIR:-$HOME/.ollama/logs}"
+PIDFILE="$LOG_DIR/llama-server.pid"
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [-p port]
+USAGE
+}
+
+term() {
+  python3 - "$1" <<'PY2'
+import os,sys
+os.kill(int(sys.argv[1]),9)
+PY2
+}
+
+while getopts ":p:h" opt; do
+  case "$opt" in
+    p) PORT="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "Missing: -$OPTARG" >&2; exit 2 ;;
+    \?) echo "Unknown: -$OPTARG" >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ -f "$PIDFILE" ]]; then
+  p=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "$p" ]] && term "$p"
+  rm -f "$PIDFILE"
+fi
+for p in $(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do term "$p"; done
+echo "stopped port=$PORT"
