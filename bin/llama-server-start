@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="${LLAMA_SERVER_MODEL:-/Users/bobo/.ollama/models/source/DeepSeek-V4-Flash-q8_0/DeepSeek-V4-Flash-q8_0.gguf}"
+PORT="${LLAMA_SERVER_PORT:-53084}"
+HOST="${LLAMA_SERVER_HOST:-0.0.0.0}"
+THREADS="${LLAMA_SERVER_THREADS:-24}"
+CTX="${LLAMA_SERVER_CTX:-1048576}"
+NGL="${LLAMA_SERVER_NGL:-16}"
+LOG_DIR="${LLAMA_SERVER_LOG_DIR:-$HOME/.ollama/logs}"
+LOG="$LOG_DIR/llama-server.log"
+PIDFILE="$LOG_DIR/llama-server.pid"
+MAX_ROT="${LLAMA_SERVER_LOG_ROTATIONS:-5}"
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [-m model] [-p port] [-t threads] [-c ctx] [-n ngl]
+USAGE
+}
+
+term() {
+  python3 - "$1" <<'PY2'
+import os,sys
+os.kill(int(sys.argv[1]),9)
+PY2
+}
+
+alive() {
+  python3 - "$1" <<'PY2'
+import os,sys
+try: os.kill(int(sys.argv[1]),0)
+except OSError: raise SystemExit(1)
+PY2
+}
+
+while getopts ":m:p:t:c:n:h" opt; do
+  case "$opt" in
+    m) MODEL="$OPTARG" ;;
+    p) PORT="$OPTARG" ;;
+    t) THREADS="$OPTARG" ;;
+    c) CTX="$OPTARG" ;;
+    n) NGL="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "Missing: -$OPTARG" >&2; exit 2 ;;
+    \?) echo "Unknown: -$OPTARG" >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+mkdir -p "$LOG_DIR"
+if [[ -f "$PIDFILE" ]]; then
+  old=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "$old" ]] && alive "$old" && term "$old"
+fi
+for p in $(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do term "$p"; done
+
+if [[ -f "$LOG" && -s "$LOG" ]]; then
+  for ((i=MAX_ROT;i>=1;i--)); do
+    [[ -e "${LOG_DIR}/llama-server-${i}.log" ]] && { (( i == MAX_ROT )) && rm -f "${LOG_DIR}/llama-server-${i}.log" || mv -f "${LOG_DIR}/llama-server-${i}.log" "${LOG_DIR}/llama-server-$((i+1)).log"; }
+  done
+  mv -f "$LOG" "${LOG_DIR}/llama-server-1.log"
+fi
+
+cd "$HOME/.ollama/llama.cpp"
+nohup llama-server -m "$MODEL" --port "$PORT" -t "$THREADS" -c "$CTX" -ngl "$NGL" --no-warmup --host "$HOST" > "$LOG" 2>&1 < /dev/null &
+echo $! > "$PIDFILE"
+echo "started pid=$! port=$PORT threads=$THREADS ctx=$CTX ngl=$NGL model=$MODEL log=$LOG"
