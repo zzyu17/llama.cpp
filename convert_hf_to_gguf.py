@@ -167,7 +167,7 @@ class ModelBase:
                 logger.info("heuristics unable to detect tensor dtype, defaulting to --outtype f16")
 
         # Configure GGUF Writer
-        self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
+        self.gguf_writer = gguf.GGUFWriter(path=fname_out, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
                                            split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
 
         # Mistral specific
@@ -780,7 +780,9 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            preserve_native_quant_tensor = name in getattr(self, "_preserve_native_quant_tensors", set())
+            preserve_integer_tensor = name.endswith(".ffn.gate.tid2eid") or preserve_native_quant_tensor
+            if data_torch.dtype not in (torch.float16, torch.float32) and not preserve_integer_tensor:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -791,6 +793,13 @@ class ModelBase:
                     break
 
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
+                if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.FFN_GATE_TID2EID, bid, suffix=""):
+                    data = LazyTorchTensor.to_eager(data_torch).to(torch.int32).numpy()
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> I32, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data)
+                    continue
+
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
@@ -868,6 +877,8 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4:
+                        data_qtype = gguf.GGMLQuantizationType.BF16
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
@@ -9199,6 +9210,428 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+    skip_mtp = True
+    merge_expert = True
+    chat_template = (
+        "{{ '<｜begin▁of▁sentence｜>' }}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+        "{{ message['content'] }}"
+        "{% elif message['role'] == 'user' %}"
+        "{{ '<｜User｜>' + message['content'] }}"
+        "{% elif message['role'] == 'assistant' %}"
+        "{{ message['content'] + '<｜end▁of▁sentence｜>' }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<｜Assistant｜></think>' }}"
+        "{% endif %}"
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._expert_buffers: list[dict[str, Tensor]] | None = None
+        self._expert_seen: list[dict[str, set[int]]] | None = None
+        self._preserve_native_quant_tensors: set[str] = set()
+        self._native_quant_weight_types: dict[str, gguf.GGMLQuantizationType] = {}
+        self._native_quant_output_types: dict[str, gguf.GGMLQuantizationType] = {}
+        self._native_quant_scales: dict[str, Callable[[], Tensor]] = {}
+
+    def set_vocab(self):
+        # transformers does not (yet) know about model_type=deepseek_v4, so the
+        # default AutoTokenizer.from_pretrained() in DeepseekV2Model.set_vocab
+        # fails inside AutoConfig before tokenizer files are touched. The V4
+        # tokenizer is a vanilla PreTrainedTokenizerFast (model-agnostic), so
+        # try the parent path first and fall back to a direct load.
+        try:
+            super().set_vocab()
+            return
+        except (AttributeError, KeyError, ValueError) as e:
+            logger.info("DeepseekV4: AutoTokenizer path failed (%s); loading PreTrainedTokenizerFast directly", e)
+
+        from transformers import PreTrainedTokenizerFast
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.dir_model)
+
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
+        assert max(tokenizer.vocab.values()) < vocab_size
+
+        tokpre = self.get_vocab_base_pre(tokenizer)
+        reverse_vocab = {id_: tok for tok, id_ in tokenizer.vocab.items()}
+        added_vocab = tokenizer.get_added_vocab()
+        added_tokens_decoder = tokenizer.added_tokens_decoder
+
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+                continue
+            token: str = reverse_vocab[i]
+            if token in added_vocab:
+                if not added_tokens_decoder[i].normalized:
+                    token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))
+                if added_tokens_decoder[i].special or self.does_token_look_special(token):
+                    toktypes.append(gguf.TokenType.CONTROL)
+                else:
+                    token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")
+                    toktypes.append(gguf.TokenType.USER_DEFINED)
+            else:
+                toktypes.append(gguf.TokenType.NORMAL)
+            tokens.append(token)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def dequant_model(self):
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if quant_method == "fp8":
+            if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4:
+                for name, gen in list(self.model_tensors.items()):
+                    if not name.endswith(".scale"):
+                        continue
+                    weight_name = name.removesuffix(".scale") + ".weight"
+                    if weight_name not in self.model_tensors:
+                        continue
+
+                    qtype = gguf.GGMLQuantizationType.MXFP4 if ".ffn.experts." in weight_name else gguf.GGMLQuantizationType.F8_E4M3_B128
+                    self._preserve_native_quant_tensors.add(weight_name)
+                    self._native_quant_weight_types[weight_name] = qtype
+                    self._native_quant_scales[weight_name] = gen
+                    del self.model_tensors[name]
+
+                return super().dequant_model()
+
+            dequant_dtype = torch.float16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else None
+            fp4_table = torch.tensor([
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ], dtype=torch.float32)
+            fp4_codes = torch.arange(256, dtype=torch.uint8)
+            fp4_pair_table = fp4_table[
+                torch.stack((fp4_codes & 0x0F, (fp4_codes >> 4) & 0x0F), dim=1).long()
+            ]
+
+            def finalize_dequant(data: Tensor) -> Tensor:
+                return data.to(dequant_dtype) if dequant_dtype is not None else data
+
+            def dequant_with_scale(weight: Tensor, scale: Tensor) -> Tensor:
+                scale = scale.float()
+
+                while scale.ndim < weight.ndim:
+                    scale = scale.unsqueeze(-1)
+
+                if scale.ndim != weight.ndim:
+                    raise ValueError(
+                        f"Unexpected DeepSeek V4 scale rank for weight {tuple(weight.shape)} and scale {tuple(scale.shape)}"
+                    )
+
+                repeats: list[int] = []
+                can_broadcast_blocks = True
+                for weight_dim, scale_dim in zip(weight.shape, scale.shape):
+                    if scale_dim == weight_dim:
+                        repeats.append(1)
+                        continue
+                    if scale_dim <= 0 or scale_dim > weight_dim:
+                        raise ValueError(
+                            f"Unexpected DeepSeek V4 scale shape {tuple(scale.shape)} for weight {tuple(weight.shape)}"
+                        )
+                    if weight_dim % scale_dim != 0:
+                        can_broadcast_blocks = False
+                        break
+                    repeats.append(weight_dim // scale_dim)
+
+                if can_broadcast_blocks:
+                    weight_shape: list[int] = []
+                    scale_shape: list[int] = []
+                    for scale_dim, repeat in zip(scale.shape, repeats):
+                        weight_shape.extend((scale_dim, repeat))
+                        scale_shape.extend((scale_dim, 1))
+                    if dequant_dtype is not None:
+                        return (
+                            weight.to(dequant_dtype).reshape(weight_shape)
+                            * scale.to(dequant_dtype).reshape(scale_shape)
+                        ).reshape(weight.shape)
+
+                    return (weight.float().reshape(weight_shape) * scale.reshape(scale_shape)).reshape(weight.shape)
+
+                for dim, (weight_dim, scale_dim) in enumerate(zip(weight.shape, scale.shape)):
+                    if scale_dim == weight_dim:
+                        continue
+                    repeat = (weight_dim + scale_dim - 1) // scale_dim
+                    if repeat > 1:
+                        scale = scale.repeat_interleave(repeat, dim)
+
+                scale = scale[tuple(slice(0, size) for size in weight.shape)]
+                return finalize_dequant(weight.float() * scale)
+
+            def dequant_packed_expert(weight: Tensor, scale: Tensor) -> Tensor:
+                weight = LazyTorchTensor.to_eager(weight)
+                scale = LazyTorchTensor.to_eager(scale).float()
+
+                if weight.dtype != torch.int8 or weight.ndim != 2:
+                    raise ValueError(f"Unexpected DeepSeek V4 expert weight {tuple(weight.shape)} {weight.dtype}")
+
+                packed = weight.view(torch.uint8)
+                unpacked = fp4_pair_table[packed.long()].reshape(packed.shape[0], packed.shape[1] * 2)
+
+                scale_groups = (unpacked.shape[1] + 31) // 32
+                if scale.ndim != 2 or scale.shape[0] != unpacked.shape[0] or scale.shape[1] < scale_groups:
+                    raise ValueError(
+                        f"Unexpected DeepSeek V4 expert scale {tuple(scale.shape)} for weight {tuple(weight.shape)}"
+                    )
+
+                scale = scale[:, :scale_groups]
+                if unpacked.shape[1] % 32 == 0:
+                    data = unpacked.reshape(unpacked.shape[0], scale_groups, 32).mul_(scale.unsqueeze(-1))
+                    return finalize_dequant(data.reshape(unpacked.shape))
+
+                scale = scale.repeat_interleave(32, dim=1)[:, :unpacked.shape[1]]
+                return finalize_dequant(unpacked.mul_(scale))
+
+            for name, gen in list(self.model_tensors.items()):
+                if not name.endswith(".scale"):
+                    continue
+                weight_name = name.removesuffix(".scale") + ".weight"
+                if weight_name not in self.model_tensors:
+                    continue
+
+                weight_gen = self.model_tensors[weight_name]
+                if ".ffn.experts." in weight_name:
+                    self.model_tensors[weight_name] = (
+                        lambda weight_gen=weight_gen, scale_gen=gen: dequant_packed_expert(weight_gen(), scale_gen())
+                    )
+                    del self.model_tensors[name]
+                    continue
+
+                self.model_tensors[weight_name] = (
+                    lambda weight_gen=weight_gen, scale_gen=gen: dequant_with_scale(weight_gen(), scale_gen())
+                )
+                del self.model_tensors[name]
+
+        return super().dequant_model()
+
+    @staticmethod
+    def _pack_fp8_e4m3_b128(weight: Tensor, scale: Tensor, name: str) -> Tensor:
+        weight = LazyTorchTensor.to_eager(weight)
+        scale = LazyTorchTensor.to_eager(scale)
+
+        if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+            raise ValueError(f"Unexpected DeepSeek V4 FP8 tensor {name}: {tuple(weight.shape)} {weight.dtype}")
+
+        rows, cols = weight.shape
+        if rows % 128 != 0 or cols % 128 != 0:
+            raise ValueError(f"DeepSeek V4 FP8 tensor {name} shape {tuple(weight.shape)} is not divisible by 128x128")
+
+        row_blocks = rows // 128
+        col_blocks = cols // 128
+        if scale.ndim != 2 or scale.shape != (row_blocks, col_blocks):
+            raise ValueError(
+                f"Unexpected DeepSeek V4 FP8 scale {tuple(scale.shape)} for tensor {name} with shape {tuple(weight.shape)}"
+            )
+
+        weight_u8 = weight.view(torch.uint8)
+        scale_u8 = scale.view(torch.uint8)
+        if scale_u8.shape != scale.shape:
+            raise ValueError(f"Unexpected DeepSeek V4 FP8 scale dtype {scale.dtype} for tensor {name}")
+        out = torch.empty((rows, col_blocks, 129), dtype=torch.uint8)
+        out.view(row_blocks, 128, col_blocks, 129)[:, :, :, 0].copy_(scale_u8[:, None, :])
+        out[:, :, 1:].copy_(weight_u8.reshape(rows, col_blocks, 128))
+        return out.reshape(rows, col_blocks * 129)
+
+    @staticmethod
+    def _pack_mxfp4(weight: Tensor, scale: Tensor, name: str) -> Tensor:
+        weight = LazyTorchTensor.to_eager(weight)
+        scale = LazyTorchTensor.to_eager(scale)
+
+        if weight.dtype != torch.int8 or weight.ndim != 2:
+            raise ValueError(f"Unexpected DeepSeek V4 packed expert tensor {name}: {tuple(weight.shape)} {weight.dtype}")
+
+        rows, packed_cols = weight.shape
+        if packed_cols % 16 != 0:
+            raise ValueError(f"DeepSeek V4 packed expert tensor {name} has {packed_cols} bytes per row, not a multiple of 16")
+
+        groups = packed_cols // 16
+        if scale.ndim != 2 or scale.shape[0] != rows or scale.shape[1] < groups:
+            raise ValueError(
+                f"Unexpected DeepSeek V4 expert scale {tuple(scale.shape)} for tensor {name} with shape {tuple(weight.shape)}"
+            )
+
+        hf = weight.view(torch.uint8).reshape(rows, groups, 16)
+        scale_u8 = scale.view(torch.uint8)
+        if scale_u8.shape != scale.shape:
+            raise ValueError(f"Unexpected DeepSeek V4 expert scale dtype {scale.dtype} for tensor {name}")
+        out = torch.empty((rows, groups, 17), dtype=torch.uint8)
+        out[:, :, 0].copy_(scale_u8[:, :groups])
+        lo = hf[:, :, :8]
+        hi = hf[:, :, 8:]
+        out[:, :, 1::2].copy_((lo & 0x0F) | ((hi & 0x0F) << 4))
+        out[:, :, 2::2].copy_((lo >> 4) | (hi & 0xF0))
+        return out.reshape(rows, groups * 17)
+
+    def set_gguf_parameters(self):
+        self.hparams["num_key_value_heads"] = self.hparams.get("num_key_value_heads", 1)
+        self.hparams["rms_norm_eps"] = self.hparams.get("rms_norm_eps", self.hparams.get("norm_eps", 1e-6))
+
+        score_func_keys = {}
+        for key in ("scoring_func", "score_func"):
+            if key in self.hparams:
+                score_func_keys[key] = self.hparams.pop(key)
+
+        try:
+            TextModel.set_gguf_parameters(self)
+        finally:
+            self.hparams.update(score_func_keys)
+
+        self.gguf_writer.add_chat_template(self.chat_template)
+
+        hparams = self.hparams
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        if (q_lora_rank := hparams.get("q_lora_rank")) is not None:
+            self.gguf_writer.add_q_lora_rank(q_lora_rank)
+
+        if (rope_dim := hparams.get("qk_rope_head_dim")) is not None:
+            self.gguf_writer.add_rope_dimension_count(rope_dim)
+
+        if (sliding_window := hparams.get("sliding_window")) is not None:
+            self.gguf_writer.add_sliding_window(sliding_window)
+
+        if (compress_rope_theta := hparams.get("compress_rope_theta")) is not None:
+            self.gguf_writer.add_rope_freq_base_swa(compress_rope_theta)
+
+        self.gguf_writer.add_leading_dense_block_count(0)
+
+        moe_intermediate_size = self.find_hparam(["moe_intermediate_size"], optional=False)
+        self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+
+        if (n_routed_experts := hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(n_routed_experts)
+
+        if (n_shared_experts := hparams.get("n_shared_experts")) is not None:
+            self.gguf_writer.add_expert_shared_count(n_shared_experts)
+
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+
+        if hparams.get("scoring_func") != "softmax":
+            self.gguf_writer.add_expert_weights_norm(True)
+
+        if (swiglu_limit := hparams.get("swiglu_limit")) is not None:
+            self.gguf_writer.add_swiglu_clamp_exp([float(swiglu_limit)] * self.block_count)
+
+        if (index_n_heads := hparams.get("index_n_heads")) is not None:
+            self.gguf_writer.add_indexer_head_count(index_n_heads)
+
+        if (index_head_dim := hparams.get("index_head_dim")) is not None:
+            self.gguf_writer.add_indexer_key_length(index_head_dim)
+
+        if (index_topk := hparams.get("index_topk")) is not None:
+            self.gguf_writer.add_indexer_top_k(index_topk)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("mtp."):
+            return
+
+        if self.hparams.get("tie_word_embeddings", False) and name == "head.weight":
+            logger.info("Skipping tied output layer 'head.weight' (will use token_embd.weight)")
+            return
+
+        native_qtype = self._native_quant_weight_types.get(name)
+        if native_qtype is not None:
+            scale_gen = self._native_quant_scales[name]
+            if native_qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
+                data_torch = self._pack_fp8_e4m3_b128(data_torch, scale_gen(), name)
+                for new_name, data_torch in TextModel.modify_tensors(self, data_torch, name, bid):
+                    self._native_quant_output_types[new_name] = native_qtype
+                    yield new_name, data_torch
+                return
+
+            if native_qtype == gguf.GGMLQuantizationType.MXFP4:
+                data_torch = self._pack_mxfp4(data_torch, scale_gen(), name)
+            else:
+                raise ValueError(f"Unsupported native quantization type for {name}: {native_qtype}")
+
+        if self.merge_expert and ".ffn.experts." in name:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+
+            match = re.fullmatch(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight", name)
+            if match is None:
+                raise ValueError(f"Unexpected DeepSeek V4 expert tensor name: {name}")
+
+            xid = int(match.group(2))
+            w_name = match.group(3)
+            if xid >= n_experts:
+                raise ValueError(f"Unexpected DeepSeek V4 expert id {xid} for tensor {name}")
+
+            if self._expert_buffers is None:
+                self._expert_buffers = [{} for _ in range(self.block_count)]
+                self._expert_seen = [{} for _ in range(self.block_count)]
+            assert self._expert_seen is not None
+
+            layer_buffers = self._expert_buffers[bid]
+            layer_seen = self._expert_seen[bid]
+
+            seen = layer_seen.setdefault(w_name, set())
+            if xid in seen:
+                raise ValueError(f"Duplicate DeepSeek V4 expert tensor: {name}")
+
+            if w_name not in layer_buffers:
+                layer_buffers[w_name] = torch.empty((n_experts, *data_torch.shape), dtype=data_torch.dtype)
+            elif layer_buffers[w_name].shape[1:] != data_torch.shape:
+                raise ValueError(
+                    f"Unexpected DeepSeek V4 expert shape {tuple(data_torch.shape)} for tensor {name}; "
+                    f"expected {tuple(layer_buffers[w_name].shape[1:])}"
+                )
+
+            layer_buffers[w_name][xid].copy_(data_torch)
+            seen.add(xid)
+
+            if all(len(layer_seen.get(done_w_name, set())) >= n_experts for done_w_name in ("w2", "w1", "w3")):
+                for done_w_name in ["w2", "w1", "w3"]:
+                    merged = layer_buffers.pop(done_w_name)
+                    del layer_seen[done_w_name]
+                    merged_name = f"layers.{bid}.ffn.experts.{done_w_name}.weight"
+                    for new_name, data_torch in TextModel.modify_tensors(self, merged, merged_name, bid):
+                        if native_qtype == gguf.GGMLQuantizationType.MXFP4:
+                            self._native_quant_output_types[new_name] = native_qtype
+                        yield new_name, data_torch
+                return
+            else:
+                return
+
+        yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        qtype = self._native_quant_output_types.get(new_name)
+        if qtype is not None:
+            return qtype
+
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._expert_seen is not None:
+            pending = [
+                f"blk {bid} {w_name}: {len(xids)}/{self.hparams['n_routed_experts']}"
+                for bid, layer_seen in enumerate(self._expert_seen)
+                for w_name, xids in layer_seen.items()
+                if xids
+            ]
+            if pending:
+                raise ValueError(f"Unprocessed DeepSeek V4 experts: {pending}")
+
+
 @ModelBase.register(
     "Mistral3ForConditionalGeneration",
     "Ministral3ForCausalLM",
@@ -13335,6 +13768,12 @@ class LazyTorchTensor(gguf.LazyBase):
         return cls._wrap_fn(func)(*args, **kwargs)
 
 
+if (torch_float8_e8m0fnu := getattr(torch, "float8_e8m0fnu", None)) is not None:
+    LazyTorchTensor._dtype_map[torch_float8_e8m0fnu] = np.uint8
+    LazyTorchTensor._dtype_byteswap_map[torch_float8_e8m0fnu] = np.uint8
+    LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch_float8_e8m0fnu
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a huggingface model to a GGML compatible file")
@@ -13347,8 +13786,8 @@ def parse_args() -> argparse.Namespace:
         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
     )
     parser.add_argument(
-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"], default="auto",
-        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
+        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "native", "auto"], default="auto",
+        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, native to preserve supported source quantization formats, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -13374,6 +13813,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", action="store_true",
         help="increase output verbosity",
+    )
+    parser.add_argument(
+        "--torch-threads", type=int, default=None,
+        help="number of PyTorch CPU threads to use for tensor conversion operations",
     )
     parser.add_argument(
         "--split-max-tensors", type=int, default=0,
@@ -13496,6 +13939,12 @@ def main() -> None:
     else:
         logging.basicConfig(level=logging.INFO)
 
+    if args.torch_threads is not None:
+        if args.torch_threads <= 0:
+            raise ValueError("--torch-threads must be a positive integer")
+        torch.set_num_threads(args.torch_threads)
+        logger.info(f"PyTorch tensor conversion threads: {torch.get_num_threads()}")
+
     if args.remote:
         hf_repo_id = args.model
         from huggingface_hub import snapshot_download
@@ -13523,6 +13972,7 @@ def main() -> None:
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
+        "native": gguf.LlamaFileType.MOSTLY_F8_E4M3_MXFP4,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 

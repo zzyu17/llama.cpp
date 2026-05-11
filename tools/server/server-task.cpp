@@ -152,11 +152,174 @@ common_chat_msg task_result_state::update_chat_msg(
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
-    auto new_msg = common_chat_parse(
-        generated_text,
-        is_partial,
-        chat_parser_params);
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params);
+    } catch (const std::runtime_error & e) {
+        // The PEG chat parser threw because the model output didn't match
+        // the auto-generated grammar. Common cause: a reasoning model that
+        // got stuck in <think>...</think> and emitted EOS without ever
+        // closing </think>, so the optional reasoning rule's until(</think>)
+        // never matched and the parser couldn't make sense of the rest.
+        //
+        // Rather than failing the entire request with a 500, fall back to a
+        // best-effort split: if the prompt primed reasoning and we have
+        // </think>, split there; otherwise treat everything as reasoning
+        // (since the prompt told the model to reason). The caller still
+        // gets a usable assistant message.
+        new_msg = common_chat_msg();
+        new_msg.role = "assistant";
+        const bool primed_reasoning =
+            chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
+            string_ends_with(chat_parser_params.generation_prompt, "<think>");
+        const size_t close_pos = generated_text.find("</think>");
+        if (primed_reasoning && close_pos != std::string::npos) {
+            std::string reasoning = generated_text.substr(0, close_pos);
+            if (string_starts_with(reasoning, "<think>")) {
+                reasoning.erase(0, std::string("<think>").size());
+            }
+            new_msg.reasoning_content = std::move(reasoning);
+            new_msg.content = generated_text.substr(close_pos + std::string("</think>").size());
+        } else if (primed_reasoning) {
+            // Model never closed </think>. We can't tell where reasoning would
+            // have ended and content begun. Two failure modes look identical
+            // here: (a) model genuinely stuck in long reasoning with no
+            // final answer, (b) model decided to skip reasoning and answered
+            // directly. Returning empty content for either case is bad UX
+            // -- the user sees a blank message bubble.
+            //
+            // Best UX: always populate content with the full text so the
+            // user sees *something*. This also matches the partial-streaming
+            // fallback below, which puts text in reasoning_content during
+            // streaming -- by the time we reach the final parse, the streamed
+            // chunks have already been delivered to the client; we just need
+            // to make sure the final consolidated message has content set so
+            // it isn't rendered as an empty bubble.
+            std::string text = generated_text;
+            if (string_starts_with(text, "<think>")) {
+                text.erase(0, std::string("<think>").size());
+            }
+            new_msg.content = std::move(text);
+        } else {
+            new_msg.content = generated_text;
+        }
+    }
+
+    if (is_partial &&
+            chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
+            string_ends_with(chat_parser_params.generation_prompt, "<think>") &&
+            generated_text.find("</think>") == std::string::npos) {
+        std::string reasoning = generated_text;
+        if (string_starts_with(reasoning, "<think>")) {
+            reasoning.erase(0, std::string("<think>").size());
+        }
+
+        new_msg.role = "assistant";
+        new_msg.reasoning_content = std::move(reasoning);
+    }
+
+    // When generation has finished (not partial) and reasoning was primed but
+    // never closed -- model hit EOS or length cutoff while still inside
+    // <think>...</think> -- the parser may succeed by stuffing everything into
+    // reasoning_content with empty content. The web UI then renders an empty
+    // message bubble alongside a (possibly very long) Reasoning toggle, which
+    // looks like the model said nothing. Promote that text into content so the
+    // user sees what the model actually produced.
+    if (!is_partial &&
+            chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
+            string_ends_with(chat_parser_params.generation_prompt, "<think>") &&
+            generated_text.find("</think>") == std::string::npos &&
+            new_msg.content.empty() &&
+            !new_msg.reasoning_content.empty()) {
+        new_msg.content = std::move(new_msg.reasoning_content);
+        new_msg.reasoning_content.clear();
+    }
+
     if (!new_msg.empty()) {
+        // First-content prefix strip (DeepSeek V4 + similar templates).
+        // Until the decision is made, suppress emission of the diff so we
+        // don't send bytes we'd later need to retract -- that breaks
+        // common_chat_msg_diff's invariant that previous content is a
+        // prefix of new content.
+        if (!prefix_strip_decided) {
+            const std::string & c = new_msg.content;
+            // Buffer until we have either:
+            //   - enough bytes to reliably classify (>= 32)
+            //   - a triple-backtick within the first 200 bytes (means we
+            //     can decide the fence-prefix strip now)
+            //   - the final non-partial chunk (must commit something)
+            //   - non-empty reasoning_content / tool_calls (these pieces
+            //     always pass through; we're only buffering content bytes)
+            const bool has_aux = !new_msg.reasoning_content.empty() || !new_msg.tool_calls.empty();
+            bool can_decide = !is_partial || has_aux || c.size() >= 32;
+            size_t fence_at = std::string::npos;
+            const size_t scan_max = std::min<size_t>(c.size(), 200);
+            for (size_t i = 0; i + 2 < scan_max; ++i) {
+                if (c[i] == '`' && c[i+1] == '`' && c[i+2] == '`') {
+                    fence_at = i;
+                    can_decide = true;
+                    break;
+                }
+            }
+
+            if (!can_decide) {
+                // Hold output for now. Don't commit chat_msg either, so
+                // msg_prv_copy stays the original empty chat_msg on the
+                // next call and the diff invariant is preserved.
+                diffs.clear();
+                return chat_msg;
+            }
+
+            // Compute the strip count once.
+            int strip = 0;
+            if (fence_at != std::string::npos && fence_at > 0) {
+                bool has_newline = false;
+                for (size_t i = 0; i < fence_at; ++i) {
+                    if (c[i] == '\n') { has_newline = true; break; }
+                }
+                if (!has_newline) {
+                    // Inline prefix glued to the fence. Drop everything
+                    // before the fence so it renders as a real code block.
+                    strip = (int) fence_at;
+                }
+            }
+            if (strip == 0) {
+                // Single sentence-boundary punctuation char with whitespace
+                // before alphanumeric/markup/UTF-8 content.
+                size_t i = 0;
+                while (i < c.size() && (c[i] == ' ' || c[i] == '\t')) ++i;
+                if (i < c.size() && (c[i] == '.' || c[i] == '?' || c[i] == '!' ||
+                                     c[i] == ',' || c[i] == ':' || c[i] == ';')) {
+                    size_t j = i + 1;
+                    while (j < c.size() && (c[j] == ' ' || c[j] == '\t' ||
+                                            c[j] == '\n' || c[j] == '\r')) ++j;
+                    if (j < c.size()) {
+                        unsigned char ch = (unsigned char) c[j];
+                        bool real_content =
+                            std::isalnum(ch) ||
+                            ch == '*' || ch == '_' || ch == '`' ||
+                            ch == '#' || ch == '"' || ch == '\'' ||
+                            ch == '(' || ch == '[' || ch == '{' ||
+                            ch >= 0x80;
+                        if (real_content) {
+                            strip = (int) j;
+                        }
+                    }
+                }
+            }
+
+            prefix_strip_decided = true;
+            prefix_strip_bytes = strip;
+        }
+
+        if (prefix_strip_bytes > 0) {
+            const size_t n = std::min<size_t>((size_t) prefix_strip_bytes, new_msg.content.size());
+            new_msg.content.erase(0, n);
+        }
+
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -1961,6 +2124,31 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+static bool server_prompt_can_restore_prefix(
+        const server_prompt        & prompt,
+        int64_t                      n_tokens,
+        common_context_seq_rm_type   seq_rm_type) {
+    if (n_tokens < 0 || n_tokens > prompt.n_tokens()) {
+        return false;
+    }
+
+    if (seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        return true;
+    }
+
+    if (n_tokens == prompt.n_tokens()) {
+        return true;
+    }
+
+    for (const auto & checkpoint : prompt.checkpoints) {
+        if (!checkpoint.empty() && checkpoint.n_tokens == n_tokens) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1981,12 +2169,16 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size) {
+server_prompt * server_prompt_cache::alloc(
+        const server_prompt        & prompt,
+        size_t                       state_size,
+        common_context_seq_rm_type   seq_rm_type) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) prompt.tokens.size() &&
+                server_prompt_can_restore_prefix(*it, prompt.n_tokens(), seq_rm_type)) {
             SRV_WRN("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1996,7 +2188,8 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->tokens.size()) {
+        if (len == (int) it->tokens.size() &&
+                server_prompt_can_restore_prefix(prompt, it->n_tokens(), seq_rm_type)) {
             SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -2032,7 +2225,12 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     return &cur;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt              & prompt,
+        const server_tokens        & tokens_new,
+        llama_context              * ctx,
+        int32_t                      id_slot,
+        common_context_seq_rm_type   seq_rm_type) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2041,13 +2239,32 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_WRN(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
+    const server_prompt_checkpoint * checkpoint_best = nullptr;
+    int64_t n_tokens_best = -1;
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
-        const float sim_cur    = float(lcp_cur) / tokens_new.size();
+        int64_t n_tokens_cur = lcp_cur;
+        const server_prompt_checkpoint * checkpoint_cur = nullptr;
+
+        if (seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && lcp_cur < (int) it->tokens.size()) {
+            n_tokens_cur = -1;
+            for (const auto & checkpoint : it->checkpoints) {
+                if (!checkpoint.empty() && checkpoint.n_tokens <= lcp_cur && checkpoint.n_tokens > n_tokens_cur) {
+                    checkpoint_cur = &checkpoint;
+                    n_tokens_cur = checkpoint.n_tokens;
+                }
+            }
+
+            if (checkpoint_cur == nullptr) {
+                continue;
+            }
+        }
+
+        const float f_keep_cur = float(n_tokens_cur) / it->tokens.size();
+        const float sim_cur    = float(n_tokens_cur) / tokens_new.size();
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -2059,14 +2276,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             sim_best    = sim_cur;
 
             it_best = it;
+            checkpoint_best = checkpoint_cur;
+            n_tokens_best = n_tokens_cur;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_WRN(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        if (checkpoint_best != nullptr) {
+            SRV_WRN(" - found better prompt checkpoint with f_keep = %.3f, sim = %.3f, n_tokens = %" PRId64 "\n",
+                    f_keep_best, sim_best, n_tokens_best);
+        } else {
+            SRV_WRN(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        }
 
-        const size_t size = it_best->data.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx, it_best->data.data(), size, id_slot, 0);
+        const std::vector<uint8_t> & data = checkpoint_best != nullptr ? checkpoint_best->data : it_best->data;
+        const llama_state_seq_flags flags = checkpoint_best != nullptr ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : 0;
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx, data.data(), size, id_slot, flags);
         if (n != size) {
             SRV_WRN("failed to restore state with size %zu\n", size);
 
@@ -2077,6 +2303,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         it_best->data.shrink_to_fit();
 
         prompt = std::move(*it_best);
+        if (checkpoint_best != nullptr) {
+            prompt.tokens.keep_first(n_tokens_best);
+            for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+                if (it->n_tokens > n_tokens_best) {
+                    it = prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         states.erase(it_best);
     }

@@ -135,7 +135,7 @@ struct server_slot {
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size);
+        auto * cur = prompt_cache.alloc(prompt, cur_size, ctx_seq_rm_type);
         if (cur == nullptr) {
             return;
         }
@@ -144,7 +144,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx, id, ctx_seq_rm_type);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2437,8 +2437,10 @@ private:
                             if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
-                                    GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
+                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d - forcing full prompt re-evaluation (non-standard attention architecture cache mismatch)\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                    // Non-standard attention (e.g. DeepSeek V4 CSA+HCA): cache state can be inconsistent. Safe fallback.
+                                    pos_next = 0;
+                                    n_past  = 0;
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
@@ -2572,12 +2574,36 @@ private:
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
-                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+                        bool restored = false;
 
-                        slot.prompt_clear(true);
+                        if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                            const server_prompt_checkpoint * checkpoint = server_prompt_find_checkpoint_before_pos(slot.prompt, p0);
 
-                        // there is no common part left
-                        slot.n_prompt_tokens_cache = 0;
+                            if (checkpoint != nullptr) {
+                                const size_t checkpoint_size = checkpoint->data.size();
+                                const size_t n = llama_state_seq_set_data_ext(ctx, checkpoint->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                                if (n == checkpoint_size) {
+                                    slot.prompt.tokens.keep_first(checkpoint->n_tokens);
+                                    slot.n_prompt_tokens_cache = checkpoint->n_tokens;
+                                    restored = true;
+                                    SLT_WRN(slot, "restored context checkpoint after failed memory_seq_rm (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                            checkpoint->pos_min, checkpoint->pos_max, checkpoint->n_tokens, (float) checkpoint_size / 1024 / 1024);
+                                } else {
+                                    SLT_ERR(slot, "failed to restore context checkpoint after failed memory_seq_rm (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                            checkpoint->pos_min, checkpoint->pos_max, checkpoint->n_tokens, (float) checkpoint_size / 1024 / 1024);
+                                }
+                            }
+                        }
+
+                        if (!restored) {
+                            SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+
+                            slot.prompt_clear(true);
+
+                            // there is no common part left
+                            slot.n_prompt_tokens_cache = 0;
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come

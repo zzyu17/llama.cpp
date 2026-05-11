@@ -43,6 +43,10 @@
 #include <TargetConditionals.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -380,6 +384,31 @@ void * ggml_aligned_malloc(size_t size) {
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
     }
+#if defined(__linux__) && !defined(GGML_USE_CPU_HBM) && !defined(TARGET_OS_OSX)
+    // For large allocations, hint the kernel to back this region with transparent
+    // huge pages. This dramatically reduces TLB pressure on memory-bandwidth-bound
+    // workloads such as large MoE expert matmuls where the working set is many GiB
+    // and the per-token weight read pattern walks millions of 4 KiB pages.
+    //
+    // The hint is best-effort: it only succeeds when the system THP policy is
+    // "always" or "madvise" and the allocation is mapped (large mallocs typically
+    // are), and silently does nothing otherwise.
+    //
+    // 2 MiB threshold avoids spending syscall time on small tensor metadata;
+    // madvise itself only operates at huge-page boundaries internally.
+    if (aligned_memory != NULL && size >= (2u << 20)) {
+        const uintptr_t hp_align = (1u << 21); // 2 MiB
+        uintptr_t       addr_v   = (uintptr_t) aligned_memory;
+        uintptr_t       addr_a   = (addr_v + hp_align - 1) & ~(hp_align - 1);
+        size_t          off      = (size_t) (addr_a - addr_v);
+        if (off < size) {
+            size_t hp_size = (size - off) & ~(hp_align - 1);
+            if (hp_size > 0) {
+                (void) madvise((void *) addr_a, hp_size, MADV_HUGEPAGE);
+            }
+        }
+    }
+#endif
     return aligned_memory;
 #endif
 }
@@ -749,6 +778,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_F8_E4M3_B128] = {
+        .type_name                = "f8_e4m3_b128",
+        .blck_size                = QK_F8_E4M3_B128,
+        .type_size                = sizeof(block_f8_e4m3_b128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3_b128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_b128_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1078,9 +1115,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "HC_WEIGHTED_SUM",
+    "LIGHTNING_INDEXER",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "hc_weighted_sum(x,w)",
+    "lightning_indexer(q,k,weights,scale_embd,scale_heads)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1217,9 +1258,12 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "FP4_ACT_QUANT",
+    "FP8_ACT_QUANT",
+    "SINKHORN_4X4",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 25, "GGML_UNARY_OP_COUNT != 25");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -1413,6 +1457,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4: wtype = GGML_TYPE_F8_E4M3_B128; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -2947,6 +2992,28 @@ struct ggml_tensor * ggml_trunc_inplace(
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_TRUNC);
 }
 
+struct ggml_tensor * ggml_fp4_act_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->ne[0] % 32 == 0);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_FP4_ACT_QUANT);
+}
+
+struct ggml_tensor * ggml_fp8_act_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->ne[0] % 64 == 0);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_FP8_ACT_QUANT);
+}
+
+struct ggml_tensor * ggml_sinkhorn_4x4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == 4 && a->ne[1] == 4);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_SINKHORN_4X4);
+}
+
 struct ggml_tensor * ggml_glu(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3250,6 +3317,62 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_hc_weighted_sum
+
+struct ggml_tensor * ggml_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(a->ne[1] == b->ne[0]);
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(b->ne[1] == a->ne[2] && b->ne[2] == 1 && b->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[2]);
+
+    result->op     = GGML_OP_HC_WEIGHTED_SUM;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_lightning_indexer
+
+struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        float                 scale_embd,
+        float                 scale_heads) {
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(q->ne[1] == weights->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1);
+    GGML_ASSERT(q->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(k->ne[3] == weights->ne[3]);
+
+    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale_embd);
+    ggml_set_op_params_f32(result, 1, scale_heads);
+
+    result->op   = GGML_OP_LIGHTNING_INDEXER;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
 
     return result;
 }
@@ -6559,6 +6682,21 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_HC_WEIGHTED_SUM: {
+            if (src0_needs_grads || src1_needs_grads) {
+                struct ggml_tensor * grad_x = ggml_repeat(ctx, grad, src0);
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * src1_cont = ggml_is_contiguous(src1) ? src1 : ggml_cont(ctx, src1);
+                    struct ggml_tensor * weights = ggml_reshape_2d(ctx, src1_cont, 1, src1->ne[0]);
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad_x, weights));
+                }
+                if (src1_needs_grads) {
+                    struct ggml_tensor * weighted_grad = ggml_mul(ctx, src0, grad_x);
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, weighted_grad), src1));
+                }
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -7686,6 +7824,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_F8_E4M3_B128: result = quantize_f8_e4m3_b128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

@@ -157,6 +157,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+    llama_build_and_test(test-server-prompt-cache.cpp)
+    target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -196,6 +199,19 @@ endif()
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(
+        NAME test-deepseek4-native-packers
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek4-native-packers.py ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-deepseek4-native-packers PROPERTIES LABELS python SKIP_RETURN_CODE 77)
+    add_test(
+        NAME test-moe-copy-lru-sim
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-moe-copy-lru-sim.py ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-moe-copy-lru-sim PROPERTIES LABELS python)
+endif()
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
@@ -231,7 +247,9 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
-set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+set_tests_properties(test-thread-safety PROPERTIES
+    FIXTURES_REQUIRED test-download-model
+    ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
 
 llama_build_and_test(test-arg-parser.cpp)
 
@@ -240,7 +258,16 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-gguf.cpp)
-llama_build_and_test(test-backend-ops.cpp)
+
+set(LLAMA_BACKEND_OPS_SMOKE_FILTER
+    "HC_WEIGHTED_SUM(n_embd=64,hc_mult=4,slice_x=0,slice_w=0),\
+MUL_MAT(type_a=iq4_xs,type_b=f32,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1),\
+MUL_MAT(type_a=f8_e4m3_b128,type_b=f32,m=1,n=64,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1),\
+MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=1,k=256),\
+MUL_MAT_ID(type_a=q3_K,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=1,k=256)")
+llama_build(test-backend-ops.cpp get-model.cpp)
+llama_test(test-backend-ops ARGS test -o "${LLAMA_BACKEND_OPS_SMOKE_FILTER}")
+llama_test(test-backend-ops NAME test-backend-ops-full LABEL backend-full ARGS test)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

@@ -784,7 +784,10 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ ds
 }
 
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
-#if CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t bits = x == 0 ? 0x00400000 : (uint32_t) x << 23;
+    return __uint_as_float(bits);
+#elif CUDART_VERSION >= 12080
     const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
     return (float) e;
 #else
@@ -830,16 +833,19 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
-static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
-#if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
-    if (!(x > 0.0f)) {
-        return 0;
+static __device__ __forceinline__ float ggml_cuda_f8_e4m3fn_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0) {
+        return 0.0f;
     }
-    const __nv_fp8_e4m3 xf(x);
-    return xf.__x;
-#else
-     NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    if ((x & 0x7F) == 0x7F) {
+        return NAN;
+    }
+
+    const int exp = (x >> 3) & 0x0F;
+    const int man = x & 0x07;
+    const float val = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man * 0.125f, exp - 7);
+
+    return (x & 0x80) ? -val : val;
 }
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
@@ -986,6 +992,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8_E4M3_B128> {
+    static constexpr int qk = QK_F8_E4M3_B128;
+    static constexpr int qr = QR_F8_E4M3_B128;
+    static constexpr int qi = QI_F8_E4M3_B128;
 };
 
 template<>

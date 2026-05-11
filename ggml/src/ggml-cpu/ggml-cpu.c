@@ -282,6 +282,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8_E4M3_B128] = {
+        .from_float               = quantize_row_f8_e4m3_b128,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_b128_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
@@ -1822,6 +1828,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
+        case GGML_OP_HC_WEIGHTED_SUM:
+            {
+                ggml_compute_forward_hc_weighted_sum(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2245,6 +2255,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
+                case GGML_UNARY_OP_FP4_ACT_QUANT:
+                case GGML_UNARY_OP_FP8_ACT_QUANT:
+                    {
+                        n_tasks = n_threads;
+                    } break;
+                case GGML_UNARY_OP_SINKHORN_4X4:
                     {
                         n_tasks = 1;
                     } break;
@@ -2287,6 +2303,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_HC_WEIGHTED_SUM:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;

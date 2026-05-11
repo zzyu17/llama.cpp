@@ -14,12 +14,16 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <limits>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -771,6 +775,59 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+enum ggml_backend_sched_moe_prefetch_policy {
+    GGML_BACKEND_SCHED_MOE_PREFETCH_NONE,
+    GGML_BACKEND_SCHED_MOE_PREFETCH_SETMARKOV,
+};
+
+struct ggml_backend_sched_moe_transition {
+    std::vector<int32_t> from;
+    std::vector<uint32_t> counts;
+};
+
+struct ggml_backend_sched_moe_cache {
+    const ggml_tensor * input;
+    int backend_id;
+    int n_expert;
+    int n_slots;
+
+    size_t expert_size;
+    size_t slot_padding;
+    size_t slot_stride;
+    size_t weights_size;
+    size_t ids_nbytes;
+
+    ggml_backend_buffer_t weights_buffer;
+    ggml_tensor weights_tensor;
+
+    ggml_backend_buffer_t ids_buffer;
+    ggml_tensor ids_tensor;
+
+    std::vector<int32_t> slot_of;
+    std::vector<int32_t> expert_in_slot;
+    std::vector<uint8_t> slot_speculative;
+    std::vector<uint64_t> lru_tick;
+    std::vector<int32_t> remapped_ids;
+    std::vector<int32_t> previous_experts;
+    std::vector<ggml_backend_sched_moe_transition> transitions;
+    uint64_t now;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t bypasses;
+    uint64_t bytes_copied;
+    uint64_t speculative_hits;
+    uint64_t prefetches;
+    uint64_t prefetch_evictions;
+    uint64_t wrong_prefetches;
+    uint64_t bytes_prefetched;
+};
+
+struct ggml_backend_sched_moe_restore {
+    ggml_tensor * node;
+    ggml_tensor * src0;
+    ggml_tensor * src2;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -817,6 +874,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    std::vector<ggml_backend_sched_moe_cache *> * moe_caches;
 
     int debug;
 
@@ -874,6 +932,11 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+static int ggml_backend_sched_backend_from_non_weight_src(
+        ggml_backend_sched_t sched,
+        ggml_tensor * tensor,
+        int max_backend_id);
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -917,6 +980,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                const int non_weight_src_backend_id = ggml_backend_sched_backend_from_non_weight_src(sched, tensor, src_backend_id);
+                if (non_weight_src_backend_id != -1) {
+                    SET_CAUSE(tensor, "1.off-src%d", non_weight_src_backend_id);
+                    return non_weight_src_backend_id;
+                }
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
@@ -980,6 +1048,35 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
             GGML_LOG_DEBUG("\n");
         }
     }
+}
+
+static int ggml_backend_sched_backend_from_non_weight_src(
+        ggml_backend_sched_t sched,
+        ggml_tensor * tensor,
+        int max_backend_id) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        ggml_tensor * src = tensor->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_t src_buffer = src->view_src != nullptr ? src->view_src->buffer : src->buffer;
+        if (src_buffer != nullptr && src_buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+
+        int src_backend_id = tensor_backend_id(src);
+        if (src_backend_id == -1 && src->view_src != nullptr) {
+            src_backend_id = tensor_backend_id(src->view_src);
+        }
+        if (src_backend_id < 0 || src_backend_id >= max_backend_id) {
+            continue;
+        }
+        if (ggml_backend_supports_op(sched->backends[src_backend_id], tensor) &&
+                ggml_backend_offload_op(sched->backends[src_backend_id], tensor)) {
+            return src_backend_id;
+        }
+    }
+    return -1;
 }
 
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
@@ -1538,18 +1635,663 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static bool ggml_backend_sched_moe_log_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SCHED_MOE_LOG");
+        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_backend_sched_moe_cache_slots() {
+    static const int slots = []() {
+        const char * env = getenv("GGML_SCHED_MOE_CACHE_SLOTS");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        const long value = strtol(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || value < 0 || value > INT_MAX) {
+            GGML_LOG_WARN("%s: ignoring invalid GGML_SCHED_MOE_CACHE_SLOTS=%s\n", __func__, env);
+            return 0;
+        }
+
+        return (int) value;
+    }();
+    return slots;
+}
+
+static enum ggml_backend_sched_moe_prefetch_policy ggml_backend_sched_moe_prefetch_policy() {
+    static const enum ggml_backend_sched_moe_prefetch_policy policy = []() {
+        const char * env = getenv("GGML_SCHED_MOE_CACHE_PREFETCH");
+        if (env == nullptr || env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "none") == 0) {
+            return GGML_BACKEND_SCHED_MOE_PREFETCH_NONE;
+        }
+        if (strcmp(env, "setmarkov") == 0) {
+            return GGML_BACKEND_SCHED_MOE_PREFETCH_SETMARKOV;
+        }
+
+        GGML_LOG_WARN("%s: ignoring invalid GGML_SCHED_MOE_CACHE_PREFETCH=%s\n", __func__, env);
+        return GGML_BACKEND_SCHED_MOE_PREFETCH_NONE;
+    }();
+    return policy;
+}
+
+static int ggml_backend_sched_moe_prefetch_limit() {
+    static const int limit = []() {
+        const char * env = getenv("GGML_SCHED_MOE_CACHE_PREFETCH_LIMIT");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        const long value = strtol(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || value < 0 || value > INT_MAX) {
+            GGML_LOG_WARN("%s: ignoring invalid GGML_SCHED_MOE_CACHE_PREFETCH_LIMIT=%s\n", __func__, env);
+            return 0;
+        }
+
+        return (int) value;
+    }();
+    return limit;
+}
+
+static bool ggml_backend_sched_moe_cache_prime_last_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SCHED_MOE_CACHE_PRIME");
+        return env != nullptr && strcmp(env, "last") == 0;
+    }();
+    return enabled;
+}
+
+static const char * ggml_backend_sched_tensor_name(const ggml_tensor * tensor) {
+    return tensor->name[0] != '\0' ? tensor->name : "<unnamed>";
+}
+
+static bool ggml_backend_sched_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->type != b->type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (a->ne[i] != b->ne[i] || a->nb[i] != b->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ggml_backend_sched_moe_cache * ggml_backend_sched_moe_cache_find(
+        ggml_backend_sched_t sched,
+        const ggml_tensor * input,
+        int backend_id) {
+    for (ggml_backend_sched_moe_cache * cache : *sched->moe_caches) {
+        if (cache->input == input && cache->backend_id == backend_id) {
+            return cache;
+        }
+    }
+    return nullptr;
+}
+
+static size_t ggml_backend_sched_moe_cache_slot_padding(const ggml_tensor * input, size_t expert_size) {
+    const size_t type_size = ggml_type_size(input->type);
+    GGML_ASSERT(type_size > 0);
+    GGML_ASSERT(expert_size % type_size == 0);
+
+    const size_t padding = std::min<size_t>(expert_size, 512);
+    return ((padding + type_size - 1) / type_size) * type_size;
+}
+
+static ggml_backend_sched_moe_cache * ggml_backend_sched_moe_cache_new(
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend,
+        const ggml_tensor * input,
+        int backend_id,
+        int n_expert,
+        int n_slots,
+        size_t expert_size) {
+    GGML_ASSERT(n_slots > 0);
+    GGML_ASSERT(n_slots <= n_expert);
+    GGML_ASSERT(input->ne[3] == 1);
+
+    ggml_backend_buffer_type_t buft = sched->bufts[backend_id];
+    const size_t padding = ggml_backend_sched_moe_cache_slot_padding(input, expert_size);
+
+    ggml_backend_sched_moe_cache * cache = new ggml_backend_sched_moe_cache();
+    cache->input       = input;
+    cache->backend_id  = backend_id;
+    cache->n_expert    = n_expert;
+    cache->n_slots     = n_slots;
+    cache->expert_size = expert_size;
+    cache->slot_padding = padding;
+    cache->slot_stride = expert_size + padding;
+    cache->weights_size = 0;
+
+    cache->weights_tensor = *input;
+    cache->weights_tensor.buffer = nullptr;
+    cache->weights_tensor.data = nullptr;
+    cache->weights_tensor.view_src = nullptr;
+    cache->weights_tensor.view_offs = 0;
+    cache->weights_tensor.extra = nullptr;
+    cache->weights_tensor.op = GGML_OP_NONE;
+    cache->weights_tensor.flags = 0;
+    cache->weights_tensor.ne[2] = n_slots + 1; // one dummy padding slot
+    cache->weights_tensor.ne[3] = 1;
+    cache->weights_tensor.nb[2] = cache->slot_stride;
+    cache->weights_tensor.nb[3] = cache->slot_stride * cache->weights_tensor.ne[2];
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        cache->weights_tensor.src[i] = nullptr;
+    }
+    ggml_format_name(&cache->weights_tensor, "%s#moe-cache#%s",
+            ggml_backend_sched_tensor_name(input), ggml_backend_name(backend));
+
+    const size_t weights_size = ggml_backend_buft_get_alloc_size(buft, &cache->weights_tensor);
+    cache->weights_size = weights_size;
+    cache->weights_buffer = ggml_backend_buft_alloc_buffer(buft, weights_size);
+    if (cache->weights_buffer == nullptr) {
+        delete cache;
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(cache->weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (ggml_backend_tensor_alloc(cache->weights_buffer, &cache->weights_tensor, ggml_backend_buffer_get_base(cache->weights_buffer)) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(cache->weights_buffer);
+        delete cache;
+        return nullptr;
+    }
+    ggml_backend_buffer_clear(cache->weights_buffer, 0);
+
+    cache->slot_of.assign(n_expert, -1);
+    cache->expert_in_slot.assign(n_slots, -1);
+    cache->slot_speculative.assign(n_slots, 0);
+    cache->lru_tick.assign(n_slots, 0);
+
+    sched->moe_caches->push_back(cache);
+
+    GGML_LOG_INFO("%s: allocated MoE expert cache for %s on %s: slots=%d/%d, bytes=%zu\n",
+            __func__, ggml_backend_sched_tensor_name(input), ggml_backend_name(backend),
+            n_slots, n_expert, weights_size);
+
+    return cache;
+}
+
+static bool ggml_backend_sched_moe_cache_ensure_ids(
+        ggml_backend_sched_moe_cache * cache,
+        ggml_backend_buffer_type_t buft,
+        const ggml_tensor * ids_tensor) {
+    const size_t ids_nbytes = ggml_nbytes(ids_tensor);
+    if (cache->ids_buffer != nullptr &&
+            cache->ids_nbytes == ids_nbytes &&
+            ggml_backend_sched_same_layout(&cache->ids_tensor, ids_tensor)) {
+        return true;
+    }
+
+    ggml_backend_buffer_free(cache->ids_buffer);
+    cache->ids_buffer = nullptr;
+    cache->ids_nbytes = 0;
+
+    cache->ids_tensor = *ids_tensor;
+    cache->ids_tensor.buffer = nullptr;
+    cache->ids_tensor.data = nullptr;
+    cache->ids_tensor.view_src = nullptr;
+    cache->ids_tensor.view_offs = 0;
+    cache->ids_tensor.extra = nullptr;
+    cache->ids_tensor.op = GGML_OP_NONE;
+    cache->ids_tensor.flags = 0;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        cache->ids_tensor.src[i] = nullptr;
+    }
+    ggml_format_name(&cache->ids_tensor, "%s#moe-cache-ids",
+            ggml_backend_sched_tensor_name(ids_tensor));
+
+    const size_t ids_alloc = ggml_backend_buft_get_alloc_size(buft, &cache->ids_tensor);
+    cache->ids_buffer = ggml_backend_buft_alloc_buffer(buft, ids_alloc);
+    if (cache->ids_buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(cache->ids_buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    if (ggml_backend_tensor_alloc(cache->ids_buffer, &cache->ids_tensor, ggml_backend_buffer_get_base(cache->ids_buffer)) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(cache->ids_buffer);
+        cache->ids_buffer = nullptr;
+        return false;
+    }
+
+    cache->ids_nbytes = ids_nbytes;
+    return true;
+}
+
+static bool ggml_backend_sched_moe_cache_prepare(
+        ggml_backend_sched_t sched,
+        ggml_backend_t split_backend,
+        int split_backend_id,
+        ggml_tensor * input,
+        ggml_tensor * node,
+        ggml_tensor * ids_tensor,
+        const std::vector<int32_t> & ids,
+        const std::vector<ggml_bitset_t> & used_ids,
+        int64_t n_expert,
+        size_t expert_size,
+        int requested_slots,
+        enum ggml_backend_sched_moe_prefetch_policy prefetch_policy,
+        int prefetch_limit,
+        bool moe_log,
+        const char ** fail_reason,
+        std::vector<ggml_backend_sched_moe_restore> & restores) {
+    if (fail_reason != nullptr) {
+        *fail_reason = nullptr;
+    }
+    auto fail = [fail_reason](const char * reason) {
+        if (fail_reason != nullptr) {
+            *fail_reason = reason;
+        }
+        return false;
+    };
+
+    if (requested_slots <= 0) {
+        return fail("disabled");
+    }
+    if (input->ne[3] != 1) {
+        return fail("unsupported_shape");
+    }
+    if (n_expert <= 0 || n_expert > INT_MAX) {
+        return fail("invalid_expert_count");
+    }
+
+    const int n_slots = std::min<int>(requested_slots, (int) n_expert);
+    std::vector<int32_t> needed;
+    needed.reserve(n_slots);
+    for (int64_t i = 0; i < n_expert; ++i) {
+        if (ggml_bitset_get(used_ids.data(), i)) {
+            needed.push_back((int32_t) i);
+        }
+    }
+    if (needed.empty()) {
+        return fail("no_experts");
+    }
+
+    const bool too_many_experts = (int) needed.size() > n_slots;
+    const bool prime_last = too_many_experts && ggml_backend_sched_moe_cache_prime_last_enabled();
+    if (too_many_experts && !prime_last) {
+        return fail("too_many_experts");
+    }
+
+    ggml_backend_sched_moe_cache * cache = ggml_backend_sched_moe_cache_find(sched, input, split_backend_id);
+    if (cache != nullptr &&
+            (cache->n_expert != n_expert || cache->n_slots != n_slots || cache->expert_size != expert_size)) {
+        return fail("cache_metadata_mismatch");
+    }
+    if (cache == nullptr) {
+        cache = ggml_backend_sched_moe_cache_new(sched, split_backend, input, split_backend_id, (int) n_expert, n_slots, expert_size);
+        if (cache == nullptr) {
+            return fail("cache_alloc_failed");
+        }
+    }
+
+    if (too_many_experts) {
+        std::vector<int32_t> prime_ids;
+        prime_ids.reserve((size_t) n_slots);
+        std::vector<uint8_t> seen((size_t) n_expert, 0);
+        for (auto it = ids.rbegin(); it != ids.rend() && (int) prime_ids.size() < n_slots; ++it) {
+            const int32_t expert_id = *it;
+            if (expert_id < 0 || expert_id >= n_expert || seen[expert_id]) {
+                continue;
+            }
+            seen[expert_id] = 1;
+            prime_ids.push_back(expert_id);
+        }
+        std::reverse(prime_ids.begin(), prime_ids.end());
+
+        size_t primed = 0;
+        size_t primed_bytes = 0;
+        for (int32_t expert_id : prime_ids) {
+            int32_t slot = cache->slot_of[expert_id];
+            if (slot >= 0) {
+                cache->slot_speculative[slot] = 1;
+                cache->lru_tick[slot] = ++cache->now;
+                continue;
+            }
+
+            for (int32_t candidate = 0; candidate < cache->n_slots; ++candidate) {
+                if (cache->expert_in_slot[candidate] == -1) {
+                    slot = candidate;
+                    break;
+                }
+            }
+
+            if (slot == -1) {
+                uint64_t best_tick = std::numeric_limits<uint64_t>::max();
+                for (int32_t candidate = 0; candidate < cache->n_slots; ++candidate) {
+                    if (cache->lru_tick[candidate] < best_tick) {
+                        best_tick = cache->lru_tick[candidate];
+                        slot = candidate;
+                    }
+                }
+            }
+            if (slot == -1) {
+                continue;
+            }
+
+            const int32_t old_expert = cache->expert_in_slot[slot];
+            if (old_expert >= 0) {
+                if (cache->slot_speculative[slot]) {
+                    cache->wrong_prefetches++;
+                }
+                cache->slot_of[old_expert] = -1;
+            }
+
+            const size_t padding = expert_id < n_expert - 1 ? cache->slot_padding : 0;
+            const size_t copy_size = expert_size + padding;
+            ggml_backend_tensor_set_async(split_backend,
+                    &cache->weights_tensor,
+                    (const uint8_t *) input->data + (size_t) expert_id * expert_size,
+                    (size_t) slot * cache->slot_stride,
+                    copy_size);
+
+            cache->expert_in_slot[slot] = expert_id;
+            cache->slot_of[expert_id] = slot;
+            cache->slot_speculative[slot] = 1;
+            cache->lru_tick[slot] = ++cache->now;
+            cache->prefetches++;
+            cache->bytes_prefetched += copy_size;
+            primed++;
+            primed_bytes += copy_size;
+        }
+
+        if (moe_log) {
+            GGML_LOG_INFO("%s: moe_cache_prime tensor=%s backend=%s slots=%d primed=%zu primed_bytes=%zu used=%zu\n",
+                    __func__, ggml_backend_sched_tensor_name(input), ggml_backend_name(split_backend),
+                    n_slots, primed, primed_bytes, needed.size());
+        }
+        return fail("too_many_experts_primed");
+    }
+
+    if (!ggml_backend_sched_moe_cache_ensure_ids(cache, sched->bufts[split_backend_id], ids_tensor)) {
+        return fail("ids_alloc_failed");
+    }
+
+    std::vector<ggml_bitset_t> predicted_ids;
+    if (prefetch_policy == GGML_BACKEND_SCHED_MOE_PREFETCH_SETMARKOV && needed.size() <= 64) {
+        ggml_backend_sched_moe_transition * prediction = nullptr;
+        for (ggml_backend_sched_moe_transition & candidate : cache->transitions) {
+            if (candidate.from == needed) {
+                prediction = &candidate;
+                break;
+            }
+        }
+
+        if (prediction != nullptr) {
+            std::vector<std::pair<int32_t, uint32_t>> candidates;
+            candidates.reserve((size_t) n_expert);
+            for (int64_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+                const uint32_t count = prediction->counts[expert_id];
+                if (count > 0) {
+                    candidates.push_back({ (int32_t) expert_id, count });
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                    [](const std::pair<int32_t, uint32_t> & a, const std::pair<int32_t, uint32_t> & b) {
+                if (a.second != b.second) {
+                    return a.second > b.second;
+                }
+                return a.first < b.first;
+            });
+
+            const size_t protect_limit = std::min<size_t>((size_t) cache->n_slots, 6);
+            predicted_ids.resize(ggml_bitset_size(n_expert));
+            for (size_t i = 0; i < std::min(protect_limit, candidates.size()); ++i) {
+                ggml_bitset_set(predicted_ids.data(), candidates[i].first);
+            }
+        }
+    }
+
+    std::vector<int32_t> misses;
+    misses.reserve(needed.size());
+    for (int32_t expert_id : needed) {
+        const int32_t slot = cache->slot_of[expert_id];
+        if (slot >= 0) {
+            cache->hits++;
+            if (cache->slot_speculative[slot]) {
+                cache->speculative_hits++;
+                cache->slot_speculative[slot] = 0;
+            }
+        } else {
+            misses.push_back(expert_id);
+            cache->misses++;
+        }
+    }
+
+    auto find_free_slot = [&]() -> int32_t {
+        for (int32_t slot = 0; slot < cache->n_slots; ++slot) {
+            if (cache->expert_in_slot[slot] == -1) {
+                return slot;
+            }
+        }
+        return -1;
+    };
+
+    auto find_victim_slot = [&](bool prefer_speculative) -> int32_t {
+        for (int pass = 0; pass < (prefer_speculative ? 4 : 2); ++pass) {
+            const bool speculative_only = prefer_speculative && (pass % 2 == 0);
+            const bool protect_predicted = pass < (prefer_speculative ? 2 : 1);
+            int32_t slot = -1;
+            uint64_t best_tick = std::numeric_limits<uint64_t>::max();
+            for (int32_t candidate = 0; candidate < cache->n_slots; ++candidate) {
+                const int32_t resident = cache->expert_in_slot[candidate];
+                GGML_ASSERT(resident >= 0);
+                if (ggml_bitset_get(used_ids.data(), resident)) {
+                    continue;
+                }
+                if (protect_predicted && !predicted_ids.empty() && ggml_bitset_get(predicted_ids.data(), resident)) {
+                    continue;
+                }
+                if (speculative_only && !cache->slot_speculative[candidate]) {
+                    continue;
+                }
+                if (cache->lru_tick[candidate] < best_tick) {
+                    best_tick = cache->lru_tick[candidate];
+                    slot = candidate;
+                }
+            }
+            if (slot >= 0) {
+                return slot;
+            }
+        }
+        return -1;
+    };
+
+    auto copy_expert_to_slot = [&](int32_t expert_id, int32_t slot, bool speculative, bool prefetch) -> size_t {
+        const int32_t old_expert = cache->expert_in_slot[slot];
+        if (old_expert >= 0) {
+            if (cache->slot_speculative[slot]) {
+                cache->wrong_prefetches++;
+            }
+            if (prefetch) {
+                cache->prefetch_evictions++;
+            }
+            cache->slot_of[old_expert] = -1;
+        }
+
+        const size_t padding = expert_id < n_expert - 1 ? cache->slot_padding : 0;
+        const size_t copy_size = expert_size + padding;
+        ggml_backend_tensor_set_async(split_backend,
+                &cache->weights_tensor,
+                (const uint8_t *) input->data + (size_t) expert_id * expert_size,
+                (size_t) slot * cache->slot_stride,
+                copy_size);
+
+        cache->expert_in_slot[slot] = expert_id;
+        cache->slot_of[expert_id] = slot;
+        cache->slot_speculative[slot] = speculative ? 1 : 0;
+        cache->lru_tick[slot] = ++cache->now;
+        return copy_size;
+    };
+
+    size_t copied_bytes = 0;
+    for (int32_t expert_id : misses) {
+        int32_t slot = find_free_slot();
+        if (slot == -1) {
+            slot = find_victim_slot(true);
+        }
+
+        if (slot == -1) {
+            cache->bypasses++;
+            return fail("no_evictable_slot");
+        }
+
+        const size_t copy_size = copy_expert_to_slot(expert_id, slot, false, false);
+        copied_bytes += copy_size;
+        cache->bytes_copied += copy_size;
+    }
+
+    for (int32_t expert_id : needed) {
+        const int32_t slot = cache->slot_of[expert_id];
+        GGML_ASSERT(slot >= 0);
+        cache->lru_tick[slot] = ++cache->now;
+    }
+
+    cache->remapped_ids = ids;
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+            const int64_t idx = i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t);
+            const int32_t expert_id = ids[idx];
+            const int32_t slot = cache->slot_of[expert_id];
+            GGML_ASSERT(slot >= 0);
+            cache->remapped_ids[idx] = slot;
+        }
+    }
+
+    ggml_backend_tensor_set_async(split_backend, &cache->ids_tensor, cache->remapped_ids.data(), 0, cache->ids_nbytes);
+
+    size_t prefetched_bytes = 0;
+    size_t prefetch_count = 0;
+    if (prefetch_policy == GGML_BACKEND_SCHED_MOE_PREFETCH_SETMARKOV && needed.size() <= 64) {
+        if (!cache->previous_experts.empty() && cache->previous_experts.size() <= 64) {
+            ggml_backend_sched_moe_transition * transition = nullptr;
+            for (ggml_backend_sched_moe_transition & candidate : cache->transitions) {
+                if (candidate.from == cache->previous_experts) {
+                    transition = &candidate;
+                    break;
+                }
+            }
+            if (transition == nullptr) {
+                cache->transitions.push_back({ cache->previous_experts, std::vector<uint32_t>((size_t) n_expert, 0) });
+                transition = &cache->transitions.back();
+            }
+
+            for (int32_t expert_id : needed) {
+                uint32_t & count = transition->counts[expert_id];
+                if (count < std::numeric_limits<uint32_t>::max()) {
+                    count++;
+                }
+            }
+        }
+
+        ggml_backend_sched_moe_transition * prediction = nullptr;
+        for (ggml_backend_sched_moe_transition & candidate : cache->transitions) {
+            if (candidate.from == needed) {
+                prediction = &candidate;
+                break;
+            }
+        }
+
+        if (prediction != nullptr) {
+            std::vector<std::pair<int32_t, uint32_t>> candidates;
+            candidates.reserve((size_t) n_expert);
+            for (int64_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+                const uint32_t count = prediction->counts[expert_id];
+                if (count > 0) {
+                    candidates.push_back({ (int32_t) expert_id, count });
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                    [](const std::pair<int32_t, uint32_t> & a, const std::pair<int32_t, uint32_t> & b) {
+                if (a.second != b.second) {
+                    return a.second > b.second;
+                }
+                return a.first < b.first;
+            });
+
+            if (prefetch_limit > 0) {
+                const size_t limit = std::min<size_t>((size_t) std::min(prefetch_limit, cache->n_slots), candidates.size());
+                for (size_t i = 0; i < limit; ++i) {
+                    const int32_t expert_id = candidates[i].first;
+                    int32_t slot = cache->slot_of[expert_id];
+                    if (slot >= 0) {
+                        cache->lru_tick[slot] = ++cache->now;
+                        continue;
+                    }
+
+                    slot = find_free_slot();
+                    if (slot == -1) {
+                        slot = find_victim_slot(true);
+                    }
+                    if (slot == -1) {
+                        break;
+                    }
+
+                    const size_t copy_size = copy_expert_to_slot(expert_id, slot, true, true);
+                    prefetched_bytes += copy_size;
+                    cache->bytes_prefetched += copy_size;
+                    cache->prefetches++;
+                    prefetch_count++;
+                }
+            }
+        }
+
+        cache->previous_experts = needed;
+    }
+
+    restores.push_back({ node, node->src[0], node->src[2] });
+    node->src[0] = &cache->weights_tensor;
+    node->src[2] = &cache->ids_tensor;
+
+    if (moe_log) {
+        GGML_LOG_INFO("%s: moe_cache tensor=%s backend=%s slots=%d expert_size=%zu cache_bytes=%zu used=%zu hits=%zu misses=%zu copied=%zu prefetches=%zu prefetched=%zu total_hits=%llu total_speculative_hits=%llu total_misses=%llu total_copied=%llu total_prefetches=%llu total_wrong_prefetches=%llu total_prefetch_evictions=%llu total_prefetched=%llu\n",
+                __func__,
+                ggml_backend_sched_tensor_name(input),
+                ggml_backend_name(split_backend),
+                cache->n_slots,
+                cache->expert_size,
+                cache->weights_size,
+                needed.size(),
+                needed.size() - misses.size(),
+                misses.size(),
+                copied_bytes,
+                prefetch_count,
+                prefetched_bytes,
+                (unsigned long long) cache->hits,
+                (unsigned long long) cache->speculative_hits,
+                (unsigned long long) cache->misses,
+                (unsigned long long) cache->bytes_copied,
+                (unsigned long long) cache->prefetches,
+                (unsigned long long) cache->wrong_prefetches,
+                (unsigned long long) cache->prefetch_evictions,
+                (unsigned long long) cache->bytes_prefetched);
+    }
+
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
+    int64_t prev_ids_n_expert = -1;
     std::vector<int32_t> ids;
+    std::vector<int32_t> id_counts;
     std::vector<ggml_bitset_t> used_ids;
+    const bool moe_log = ggml_backend_sched_moe_log_enabled();
+    const int moe_cache_slots = ggml_backend_sched_moe_cache_slots();
+    const enum ggml_backend_sched_moe_prefetch_policy moe_prefetch_policy = ggml_backend_sched_moe_prefetch_policy();
+    const int moe_prefetch_limit = ggml_backend_sched_moe_prefetch_limit();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        std::vector<ggml_backend_sched_moe_restore> moe_restores;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1574,13 +2316,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
+                ggml_tensor * node = nullptr;
+                if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer)) {
+                    for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+                        ggml_tensor * candidate = split->graph.nodes[node_id];
+                        if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] == input_cpy) {
+                            node = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (node != nullptr) {
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -1601,7 +2348,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
-                    if (ids_tensor != prev_ids_tensor) {
+                    if (ids_tensor != prev_ids_tensor || n_expert != prev_ids_n_expert) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
@@ -1609,55 +2356,132 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // find the used experts
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
+                        id_counts.clear();
+                        id_counts.resize(n_expert);
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
+                                id_counts[id]++;
                             }
                         }
 
                         prev_ids_tensor = ids_tensor;
+                        prev_ids_n_expert = n_expert;
                     }
 
-                    // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                    const char * moe_cache_bypass_reason = nullptr;
+                    const bool moe_cache_used = ggml_backend_sched_moe_cache_prepare(
+                            sched, split_backend, split_backend_id, input, node, ids_tensor, ids, used_ids,
+                            n_expert, expert_size, moe_cache_slots, moe_prefetch_policy, moe_prefetch_limit,
+                            moe_log, &moe_cache_bypass_reason, moe_restores);
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
-                    };
-
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    if (!moe_cache_used) {
+                        if (moe_log && moe_cache_slots > 0) {
+                            GGML_LOG_INFO(
+                                "%s: moe_cache_bypass tensor=%s node=%s ids=%s backend=%s slots=%d reason=%s n_expert=%lld expert_size=%zu\n",
+                                __func__,
+                                ggml_backend_sched_tensor_name(input),
+                                ggml_backend_sched_tensor_name(node),
+                                ggml_backend_sched_tensor_name(ids_tensor),
+                                ggml_backend_name(split_backend),
+                                moe_cache_slots,
+                                moe_cache_bypass_reason != nullptr ? moe_cache_bypass_reason : "unknown",
+                                (long long) n_expert,
+                                expert_size);
                         }
 
-                        if (id == last_id + 1) {
-                            last_id = id;
-                            continue;
+                        // group consecutive experts and copy them together
+                        size_t copy_bytes = 0;
+                        int copy_ranges = 0;
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                            const size_t bytes = expert_size_copy + padding_end;
+
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                bytes);
+
+                            if (moe_log) {
+                                copy_bytes += bytes;
+                                copy_ranges++;
+                            }
+                        };
+
+                        int id = 0;
+                        while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        if (id < n_expert) {
+                            int32_t first_id = id;
+                            int32_t last_id = first_id;
+
+                            for (++id; id < n_expert; ++id) {
+                                if (!ggml_bitset_get(used_ids.data(), id)) {
+                                    continue;
+                                }
+
+                                if (id == last_id + 1) {
+                                    last_id = id;
+                                    continue;
+                                }
+
+                                copy_experts(first_id, last_id);
+
+                                first_id = id;
+                                last_id = id;
+                            }
+                            copy_experts(first_id, last_id);
                         }
 
-                        copy_experts(first_id, last_id);
+                        if (moe_log) {
+                            std::string used_ids_str;
+                            std::string used_id_counts_str;
+                            size_t used_count = 0;
+                            for (int64_t i = 0; i < n_expert; ++i) {
+                                if (!ggml_bitset_get(used_ids.data(), i)) {
+                                    continue;
+                                }
+                                if (!used_ids_str.empty()) {
+                                    used_ids_str += ",";
+                                }
+                                used_ids_str += std::to_string(i);
+                                if (!used_id_counts_str.empty()) {
+                                    used_id_counts_str += ",";
+                                }
+                                used_id_counts_str += std::to_string(i);
+                                used_id_counts_str += ":";
+                                used_id_counts_str += std::to_string(id_counts[i]);
+                                used_count++;
+                            }
 
-                        first_id = id;
-                        last_id = id;
+                            GGML_LOG_INFO(
+                                "%s: moe_copy split=%d input=%d tensor=%s node=%s ids=%s src_backend=%s dst_backend=%s n_expert=%lld expert_size=%zu used=%zu used_bytes=%zu ranges=%d copy_bytes=%zu id_counts=[%s] ids=[%s]\n",
+                                __func__,
+                                split_id,
+                                input_id,
+                                ggml_backend_sched_tensor_name(input),
+                                ggml_backend_sched_tensor_name(node),
+                                ggml_backend_sched_tensor_name(ids_tensor),
+                                ggml_backend_name(input_backend),
+                                ggml_backend_name(split_backend),
+                                (long long) n_expert,
+                                expert_size,
+                                used_count,
+                                used_count * expert_size,
+                                copy_ranges,
+                                copy_bytes,
+                                used_id_counts_str.c_str(),
+                                used_ids_str.c_str());
+                        }
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1674,9 +2498,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        auto restore_moe_cache_nodes = [&]() {
+            for (ggml_backend_sched_moe_restore & restore : moe_restores) {
+                restore.node->src[0] = restore.src0;
+                restore.node->src[2] = restore.src2;
+            }
+        };
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                restore_moe_cache_nodes();
                 return ec;
             }
         } else {
@@ -1699,6 +2531,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    restore_moe_cache_nodes();
                     return ec;
                 }
 
@@ -1712,6 +2545,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j0 = j1;
             }
         }
+        restore_moe_cache_nodes();
 
         // record the event of this copy
         if (split->n_inputs > 0) {
@@ -1787,6 +2621,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->moe_caches = new std::vector<ggml_backend_sched_moe_cache *>();
 
     ggml_backend_sched_reset(sched);
 
@@ -1802,6 +2637,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    for (ggml_backend_sched_moe_cache * cache : *sched->moe_caches) {
+        ggml_backend_buffer_free(cache->weights_buffer);
+        ggml_backend_buffer_free(cache->ids_buffer);
+        delete cache;
+    }
+    delete sched->moe_caches;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);

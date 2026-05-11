@@ -61,6 +61,8 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/hc-weighted-sum.cuh"
+#include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2741,6 +2743,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_TRUNC:
                     ggml_cuda_op_trunc(ctx, dst);
                     break;
+                case GGML_UNARY_OP_FP4_ACT_QUANT:
+                    ggml_cuda_op_fp4_act_quant(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_FP8_ACT_QUANT:
+                    ggml_cuda_op_fp8_act_quant(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_SINKHORN_4X4:
+                    ggml_cuda_op_sinkhorn_4x4(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_EXPM1:
                     ggml_cuda_op_expm1(ctx, dst);
                     break;
@@ -2819,6 +2830,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_HC_WEIGHTED_SUM:
+            ggml_cuda_op_hc_weighted_sum(ctx, dst);
+            break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            ggml_cuda_op_lightning_indexer(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -3089,6 +3106,30 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+
+    // Wide-prefill graphs (e.g. DeepSeek4 batched prefill at ub>=768)
+    // exceed CUDA graph capture memory budgets. The most reliable signal
+    // for "this graph is processing many tokens at once" is MUL_MAT_ID's
+    // ne[2] dimension, which is exactly work_tokens. Regular MUL_MAT
+    // ne[1] is unreliable because some matmuls (e.g. V4's HC_POST
+    // batched mixer) have ne[1] = n_embd regardless of work_tokens.
+    int64_t max_mmid_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            if (node->ne[2] > max_mmid_tokens) {
+                max_mmid_tokens = node->ne[2];
+            }
+        }
+    }
+    if (max_mmid_tokens >= 384) {
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: disabling CUDA graphs due to wide prefill mmid ne[2]=%lld\n",
+                       __func__, (long long) max_mmid_tokens);
+#endif
+        return false;
+    }
+
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4885,6 +4926,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // TODO: should become:
                     //return ggml_is_contiguous_rows(op->src[0]);
                     return ggml_is_contiguous(op->src[0]);
+                case GGML_UNARY_OP_FP4_ACT_QUANT:
+                    return op->src[0]->type == op->type && op->ne[0] % 32 == 0 && ggml_is_contiguous(op->src[0]) &&
+                        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_UNARY_OP_FP8_ACT_QUANT:
+                    return op->src[0]->type == op->type && op->ne[0] % 64 == 0 && ggml_is_contiguous(op->src[0]) &&
+                        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_UNARY_OP_SINKHORN_4X4:
+                    return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        op->ne[0] == 4 && op->ne[1] == 4 && op->ne[3] == 1 &&
+                        ggml_are_same_shape(op->src[0], op) &&
+                        ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
             }
@@ -4948,6 +5000,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_F8_E4M3_B128:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5183,6 +5236,37 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_HC_WEIGHTED_SUM:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == op->src[1]->ne[0] &&
+                op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                op->src[0]->ne[3] == 1 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[1] == op->src[0]->ne[2] &&
+                op->ne[2] == 1 && op->ne[3] == 1;
+        case GGML_OP_LIGHTNING_INDEXER:
+            // The CUDA kernel currently only handles n_embd=128, n_head=64
+            // (matches DeepSeek V3.2 / V4 indexer shapes). Other shapes
+            // GGML_ABORT inside the kernel; surface that here so the
+            // scheduler keeps the op on a backend that can run it.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == 128 &&
+                op->src[0]->ne[1] == 64 &&
+                op->src[1]->ne[0] == 128 &&
+                op->src[1]->ne[1] == 1 &&
+                (op->src[1]->type == GGML_TYPE_F32 ||
+                 op->src[1]->type == GGML_TYPE_F16 ||
+                 op->src[1]->type == GGML_TYPE_BF16 ||
+                 op->src[1]->type == GGML_TYPE_Q4_0 ||
+                 op->src[1]->type == GGML_TYPE_Q4_1 ||
+                 op->src[1]->type == GGML_TYPE_Q5_0 ||
+                 op->src[1]->type == GGML_TYPE_Q5_1 ||
+                 op->src[1]->type == GGML_TYPE_Q8_0);
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:

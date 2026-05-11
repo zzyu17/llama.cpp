@@ -106,6 +106,16 @@ struct task_result_state {
     bool thinking_block_started = false;
     bool text_block_started = false;
 
+    // Some chat templates (notably DeepSeek V4 with </think> injection)
+    // can have the model open with stray punctuation or a "filename" hint
+    // (e.g. " game.html") glued directly to a code fence, breaking the
+    // markdown render. Buffer the first few content bytes, decide once
+    // how much to strip, then commit. Stays empty/false until the strip
+    // decision is made; once made, prefix_strip_decided=true and
+    // prefix_strip_bytes is the stable number of leading bytes to drop.
+    bool prefix_strip_decided = false;
+    int  prefix_strip_bytes = 0;
+
     // for OpenAI Responses streaming API
     const std::string oai_resp_id;
     const std::string oai_resp_reasoning_id;
@@ -619,6 +629,18 @@ struct server_prompt {
     }
 };
 
+inline const server_prompt_checkpoint * server_prompt_find_checkpoint_before_pos(
+        const server_prompt & prompt,
+        llama_pos             p0) {
+    for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+        if (it->pos_max < p0 && it->n_tokens >= 0 && (size_t) it->n_tokens <= prompt.tokens.size()) {
+            return &*it;
+        }
+    }
+
+    return nullptr;
+}
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -637,9 +659,17 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size);
+    server_prompt * alloc(
+            const server_prompt        & prompt,
+            size_t                       state_size,
+            common_context_seq_rm_type   seq_rm_type);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx, int32_t id_slot);
+    bool load(
+            server_prompt              & prompt,
+            const server_tokens        & tokens_new,
+            llama_context              * ctx,
+            int32_t                      id_slot,
+            common_context_seq_rm_type   seq_rm_type);
 
     void update();
 };

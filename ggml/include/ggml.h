@@ -429,7 +429,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
@@ -467,6 +468,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -576,6 +578,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_HC_WEIGHTED_SUM,
+        GGML_OP_LIGHTNING_INDEXER,
 
         GGML_OP_COUNT,
     };
@@ -603,6 +607,9 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        GGML_UNARY_OP_FP4_ACT_QUANT,
+        GGML_UNARY_OP_FP8_ACT_QUANT,
+        GGML_UNARY_OP_SINKHORN_4X4,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1246,7 +1253,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // Blockwise activation quant-dequant simulation used by DeepSeek4 QAT paths.
+    GGML_API struct ggml_tensor * ggml_fp4_act_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_fp8_act_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_sinkhorn_4x4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // xIELU activation function
     // x = x * (c_a(alpha_n) + c_b(alpha_p, beta) * sigmoid(beta * x)) + eps * (x > 0)
@@ -1412,6 +1430,31 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // weighted sum over the HC dimension:
+    // a: [n_embd, hc_mult], b: [hc_mult] => result: [n_embd]
+    GGML_API struct ggml_tensor * ggml_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // Lightning indexer: fused sparse-attention scoring used by DeepSeek
+    // V3.2/V4. Computes
+    //   score[k, b, 1, s] = sum_h relu(<q[:, h, b, s], k[:, 0, k, s]> * scale_embd)
+    //                          * weights[h, b, 0, s] * scale_heads
+    //  q:       [n_embd, n_heads, n_batch, n_stream]  F32
+    //  k:       [n_embd, 1,       n_kv,    n_stream]  F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
+    //  weights: [n_heads, n_batch, 1,      n_stream]  F32
+    //  result:  [n_kv,   n_batch,  1,      n_stream]  F32
+    // Replaces the explicit mul_mat -> relu -> mul(weights) -> sum_rows
+    // sequence with a single fused kernel.
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            float                 scale_embd,
+            float                 scale_heads);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
