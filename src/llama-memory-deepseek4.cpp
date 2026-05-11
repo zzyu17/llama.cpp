@@ -125,7 +125,7 @@ static void deepseek4_write_tensor(llama_io_write_i & io, const ggml_tensor * te
 
 static void deepseek4_read_tensor(llama_io_read_i & io, ggml_tensor * tensor) {
     uint32_t present;
-    io.read_to(&present, sizeof(present));
+    io.read(&present, sizeof(present));
 
     if (!present) {
         if (tensor != nullptr) {
@@ -144,11 +144,11 @@ static void deepseek4_read_tensor(llama_io_read_i & io, ggml_tensor * tensor) {
     uint64_t active_bytes_ref;
     uint64_t total_bytes_ref;
 
-    io.read_to(&type_ref,         sizeof(type_ref));
-    io.read_to(&n_dims_ref,       sizeof(n_dims_ref));
-    io.read_to(ne_ref,            sizeof(ne_ref));
-    io.read_to(&active_bytes_ref, sizeof(active_bytes_ref));
-    io.read_to(&total_bytes_ref,  sizeof(total_bytes_ref));
+    io.read(&type_ref,         sizeof(type_ref));
+    io.read(&n_dims_ref,       sizeof(n_dims_ref));
+    io.read(ne_ref,            sizeof(ne_ref));
+    io.read(&active_bytes_ref, sizeof(active_bytes_ref));
+    io.read(&total_bytes_ref,  sizeof(total_bytes_ref));
 
     if (type_ref != static_cast<int32_t>(tensor->type)) {
         throw std::runtime_error("DeepSeek4 state tensor type mismatch");
@@ -171,7 +171,9 @@ static void deepseek4_read_tensor(llama_io_read_i & io, ggml_tensor * tensor) {
     }
 
     if (active_bytes_ref > 0) {
-        ggml_backend_tensor_set(tensor, io.read(active_bytes_ref), 0, active_bytes_ref);
+        std::vector<uint8_t> data(active_bytes_ref);
+        io.read(data.data(), active_bytes_ref);
+        ggml_backend_tensor_set(tensor, data.data(), 0, active_bytes_ref);
     }
     if (active_bytes_ref < total_bytes) {
         // Preserve the "untouched-slot == zero" invariant the compute graph relies on:
@@ -575,13 +577,13 @@ void llama_memory_deepseek4::state_read(llama_io_read_i & io, llama_seq_id seq_i
     uint32_t has_data;
     uint32_t seq_count;
 
-    io.read_to(&version,       sizeof(version));
-    io.read_to(&n_ctx_seq_ref, sizeof(n_ctx_seq_ref));
-    io.read_to(&n_seq_max_ref, sizeof(n_seq_max_ref));
-    io.read_to(&n_layer_ref,   sizeof(n_layer_ref));
-    io.read_to(&seq_mode,      sizeof(seq_mode));
-    io.read_to(&has_data,      sizeof(has_data));
-    io.read_to(&seq_count,     sizeof(seq_count));
+    io.read(&version,       sizeof(version));
+    io.read(&n_ctx_seq_ref, sizeof(n_ctx_seq_ref));
+    io.read(&n_seq_max_ref, sizeof(n_seq_max_ref));
+    io.read(&n_layer_ref,   sizeof(n_layer_ref));
+    io.read(&seq_mode,      sizeof(seq_mode));
+    io.read(&has_data,      sizeof(has_data));
+    io.read(&seq_count,     sizeof(seq_count));
 
     if (version != DEEPSEEK4_STATE_VERSION) {
         throw std::runtime_error("DeepSeek4 state version mismatch");
@@ -600,8 +602,8 @@ void llama_memory_deepseek4::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
         llama_pos pos_min;
         llama_pos pos_max;
-        io.read_to(&pos_min, sizeof(pos_min));
-        io.read_to(&pos_max, sizeof(pos_max));
+        io.read(&pos_min, sizeof(pos_min));
+        io.read(&pos_max, sizeof(pos_max));
 
         if (seq_id < 0 || static_cast<size_t>(seq_id) >= seq_pos_min_v.size()) {
             throw std::runtime_error("DeepSeek4 sequence state destination is out of range");
@@ -614,8 +616,8 @@ void llama_memory_deepseek4::state_read(llama_io_read_i & io, llama_seq_id seq_i
         for (uint32_t i = 0; i < seq_count; ++i) {
             llama_pos pos_min;
             llama_pos pos_max;
-            io.read_to(&pos_min, sizeof(pos_min));
-            io.read_to(&pos_max, sizeof(pos_max));
+            io.read(&pos_min, sizeof(pos_min));
+            io.read(&pos_max, sizeof(pos_max));
 
             if (i < n_read) {
                 seq_pos_min_v[i] = pos_min;

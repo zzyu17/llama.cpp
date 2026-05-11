@@ -13703,6 +13703,9 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
+        # Some torch builds do not expose float8_e8m0fnu, but we only need byte-wise
+        # access when packing native DeepSeek V4 scales.
+        "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:
