@@ -75,6 +75,44 @@ while getopts ":m:p:t:c:n:b:u:f:s:wh" opt; do
 done
 shift $((OPTIND - 1))
 
+# --- alias resolution ---
+ALIAS_FILE="$(dirname "$0")/model-aliases.json"
+if [[ -f "$ALIAS_FILE" ]]; then
+  resolved=$(python3 - "$MODEL" "$ALIAS_FILE" <<'PY3'
+import json, sys, os
+model = sys.argv[1]
+alias_file = sys.argv[2]
+# If it looks like a real file path, use it directly
+if os.path.exists(model):
+    print(model)
+    sys.exit(0)
+with open(alias_file) as f:
+    aliases = json.load(f)
+resolved = aliases.get(model, "")
+if resolved and os.path.exists(resolved):
+    print(resolved)
+else:
+    print("")
+PY3
+  )
+  if [[ -n "$resolved" ]]; then
+    echo "[alias] $MODEL -> $resolved" >&2
+    MODEL="$resolved"
+  elif [[ ! -f "$MODEL" ]]; then
+    echo "Error: model not found: $MODEL (not a file path, not a known alias)" >&2
+    echo "Known aliases:" >&2
+    python3 - "$ALIAS_FILE" <<'PY4' >&2
+import json, sys
+with open(sys.argv[1]) as f:
+    aliases = json.load(f)
+for k, v in aliases.items():
+    if not k.startswith("$"):
+        print(f"  {k} -> {v}")
+PY4
+    exit 1
+  fi
+fi
+
 mkdir -p "$LOG_DIR"
 if [[ -f "$PIDFILE" ]]; then
   old=$(cat "$PIDFILE" 2>/dev/null || true)
