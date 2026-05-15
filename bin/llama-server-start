@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force GPU offload for single-token generation (default threshold=32 blocks GPU during decode)
+export GGML_OP_OFFLOAD_MIN_BATCH="${GGML_OP_OFFLOAD_MIN_BATCH:-1}"
+
 MODEL="${LLAMA_SERVER_MODEL:-$HOME/.ollama/models/source/DeepSeek-V4-Flash-FP4-FP8-native/DeepSeek-V4-Flash-FP4-FP8-native.gguf}"
 PORT="${LLAMA_SERVER_PORT:-53084}"
 HOST="${LLAMA_SERVER_HOST:-0.0.0.0}"
