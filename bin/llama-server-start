@@ -8,7 +8,7 @@ THREADS="${LLAMA_SERVER_THREADS:-24}"
 CTX="${LLAMA_SERVER_CTX:-262144}"
 NGL="${LLAMA_SERVER_NGL:-50}"
 BATCH="${LLAMA_SERVER_BATCH:-2048}"
-UBATCH="${LLAMA_SERVER_UBATCH:-512}"
+UBATCH="${LLAMA_SERVER_UBATCH:-128}"
 NPARALLEL="${LLAMA_SERVER_NPARALLEL:-1}"
 FLASH_ATTN="${LLAMA_SERVER_FLASH_ATTN:-off}"
 NO_WARMUP="${LLAMA_SERVER_NO_WARMUP:-1}"
@@ -28,7 +28,7 @@ Options:
   -c  CTX      Context size (default: 262144)
   -n  NGL      GPU layers to offload (default: 50)
   -b  BATCH    Logical batch size (default: 2048)
-  -ub UBATCH   Physical micro-batch size (default: 512)
+  -ub UBATCH   Physical micro-batch size (default: 128, max safe for Metal)
   -fa ATTN     Flash attention: on, off, auto (default: off)
   -s  NPARALLEL Parallel request slots (default: 1)
   --warmup     Enable model warmup on startup (default: disabled)
