@@ -5,7 +5,7 @@ MODEL="${LLAMA_SERVER_MODEL:-$HOME/.ollama/models/source/DeepSeek-V4-Flash-FP4-F
 PORT="${LLAMA_SERVER_PORT:-53084}"
 HOST="${LLAMA_SERVER_HOST:-0.0.0.0}"
 THREADS="${LLAMA_SERVER_THREADS:-24}"
-CTX="${LLAMA_SERVER_CTX:-65536}"
+CTX="${LLAMA_SERVER_CTX:-262144}"
 NGL="${LLAMA_SERVER_NGL:-50}"
 BATCH="${LLAMA_SERVER_BATCH:-2048}"
 UBATCH="${LLAMA_SERVER_UBATCH:-512}"
@@ -25,7 +25,7 @@ Options:
   -m  MODEL    Model GGUF path (default: native DeepSeek-V4-Flash FP8/MXFP4)
   -p  PORT     Server port (default: 53084)
   -t  THREADS  CPU threads (default: 24)
-  -c  CTX      Context size (default: 65536)
+  -c  CTX      Context size (default: 262144)
   -n  NGL      GPU layers to offload (default: 50)
   -b  BATCH    Logical batch size (default: 2048)
   -ub UBATCH   Physical micro-batch size (default: 512)
