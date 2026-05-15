@@ -1,0 +1,9 @@
+{{ bos_token }}
+{% for message in messages %}
+{% if message["role"] == "system" %}{{ message["content"] }}
+{% elif message["role"] == "user" %}{{ "<｜User｜>" + message["content"] }}
+{% elif message["role"] == "assistant" %}
+{% if message["reasoning_content"] is defined and message["reasoning_content"] %}<think>{{ message["reasoning_content"] }}</think>{{ message["content"] }}{% else %}{{ message["content"] }}{% endif %}{{ "<｜end▁of▁sentence｜>" }}
+{% endif %}
+{% endfor %}
+{% if add_generation_prompt %}{{ "<｜Assistant｜>" }}{% if enable_thinking %}<think>{% else %}</think>{% endif %}{% endif %}

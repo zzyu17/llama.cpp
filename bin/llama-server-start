@@ -82,7 +82,6 @@ if [[ -f "$ALIAS_FILE" ]]; then
 import json, sys, os
 model = sys.argv[1]
 alias_file = sys.argv[2]
-# If it looks like a real file path, use it directly
 if os.path.exists(model):
     print(model)
     sys.exit(0)
@@ -127,13 +126,21 @@ if [[ -f "$LOG" && -s "$LOG" ]]; then
   mv -f "$LOG" "${LOG_DIR}/llama-server-1.log"
 fi
 
+# --- chat template ---
+CHAT_TEMPLATE_FILE="$(dirname "$0")/chat-template.jinja"
+if [[ -f "$CHAT_TEMPLATE_FILE" ]]; then
+  TMPL_ARGS=(--chat-template-file "$CHAT_TEMPLATE_FILE")
+else
+  TMPL_ARGS=()
+fi
+
 # Build extra args
 EXTRA_ARGS=()
 [[ "$NO_WARMUP" == "1" ]] && EXTRA_ARGS+=(--no-warmup)
 [[ "$FLASH_ATTN" != "off" ]] && EXTRA_ARGS+=(--flash-attn "$FLASH_ATTN")
 
 cd "$HOME/.ollama/llama.cpp"
-nohup llama-server \
+nohup build/bin/llama-server \
   -m "$MODEL" \
   --port "$PORT" \
   -t "$THREADS" \
@@ -143,6 +150,8 @@ nohup llama-server \
   -ub "$UBATCH" \
   -np "$NPARALLEL" \
   --host "$HOST" \
+  --reasoning auto \
+  ${TMPL_ARGS:+"${TMPL_ARGS[@]}"} \
   ${EXTRA_ARGS:+"${EXTRA_ARGS[@]}"} \
   > "$LOG" 2>&1 < /dev/null &
 
